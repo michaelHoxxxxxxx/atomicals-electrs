@@ -4,7 +4,21 @@ extern crate anyhow;
 #[macro_use]
 extern crate serde_derive;
 
-pub mod atomicals;
+pub mod atomicals {
+    mod protocol;
+    mod state;
+    mod storage;
+    mod tx_parser;
+    mod rpc;
+    mod websocket;
+
+    pub use protocol::{AtomicalId, AtomicalOperation, AtomicalType};
+    pub use state::AtomicalsState;
+    pub use storage::AtomicalsStorage;
+    pub use rpc::AtomicalsRpc;
+    pub use websocket::{WsServer, WsMessage, SubscriptionType};
+}
+
 pub mod chain;
 pub mod config;
 pub mod daemon;

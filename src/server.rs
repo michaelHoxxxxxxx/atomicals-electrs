@@ -247,3 +247,82 @@ fn recv_loop(peer_id: usize, stream: &TcpStream, server_tx: Sender<Event>) -> Re
     server_tx.send(Event { peer_id, msg })?;
     Ok(())
 }
+
+use anyhow::Result;
+use std::sync::Arc;
+
+use crate::atomicals::{AtomicalsState, WsServer};
+use crate::config::Config;
+use crate::metrics::Metrics;
+
+pub struct Server {
+    config: Config,
+    metrics: Arc<Metrics>,
+    atomicals_state: Arc<AtomicalsState>,
+    ws_server: Arc<WsServer>,
+}
+
+impl Server {
+    pub fn new(config: Config) -> Result<Self> {
+        let metrics = Arc::new(Metrics::new()?);
+        let atomicals_state = Arc::new(AtomicalsState::new()?);
+        let ws_server = Arc::new(WsServer::new(atomicals_state.clone()));
+
+        Ok(Self {
+            config,
+            metrics,
+            atomicals_state,
+            ws_server,
+        })
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        // 启动 WebSocket 服务器
+        let ws_port = self.config.websocket_port.unwrap_or(8080);
+        let ws_server = self.ws_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ws_server.start(ws_port).await {
+                error!("WebSocket server error: {}", e);
+            }
+        });
+
+        // 其他服务器逻辑...
+        
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::connect_async;
+    use url::Url;
+
+    #[tokio::test]
+    async fn test_websocket_server() -> Result<()> {
+        // 创建配置
+        let mut config = Config::default();
+        config.websocket_port = Some(8081);
+
+        // 创建服务器
+        let server = Server::new(config)?;
+        
+        // 启动服务器
+        let server_handle = tokio::spawn(server.run());
+        
+        // 等待服务器启动
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        
+        // 测试 WebSocket 连接
+        let url = Url::parse("ws://127.0.0.1:8081/ws")?;
+        let (ws_stream, _) = connect_async(url).await?;
+        
+        // 关闭连接
+        drop(ws_stream);
+        
+        // 关闭服务器
+        server_handle.abort();
+        
+        Ok(())
+    }
+}

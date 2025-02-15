@@ -5,6 +5,12 @@ use serde::{Serialize, Deserialize};
 
 use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
 use super::tx_parser;
+use dashmap::DashMap;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+
+use super::websocket::{WsMessage, AtomicalUpdate, UpdateType, OperationNotification, OperationStatus};
 
 /// Atomical 所有者信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,18 +44,23 @@ pub struct AtomicalOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicalsState {
     /// 所有 Atomicals 的输出
-    outputs: HashMap<AtomicalId, AtomicalOutput>,
+    outputs: DashMap<AtomicalId, AtomicalOutput>,
     /// 已封印的 Atomicals
-    sealed: HashMap<AtomicalId, bool>,
+    sealed: DashMap<AtomicalId, bool>,
+    /// WebSocket 广播通道
+    broadcast_tx: broadcast::Sender<WsMessage>,
 }
 
 impl AtomicalsState {
     /// 创建新的状态
-    pub fn new() -> Self {
-        Self {
-            outputs: HashMap::new(),
-            sealed: HashMap::new(),
-        }
+    pub fn new() -> Result<Self> {
+        let (broadcast_tx, _) = broadcast::channel(1024);
+        
+        Ok(Self {
+            outputs: DashMap::new(),
+            sealed: DashMap::new(),
+            broadcast_tx,
+        })
     }
 
     /// 检查 Atomical 是否存在
@@ -105,14 +116,23 @@ impl AtomicalsState {
 
                     // 保存输出
                     self.outputs.insert(atomical_id, output);
+                    
+                    // 发送状态更新通知
+                    self.notify_state_update(&atomical_id)?;
                 }
                 AtomicalOperation::Update { atomical_id, metadata } => {
                     if let Some(output) = self.outputs.get_mut(&atomical_id) {
                         output.metadata = Some(metadata);
                     }
+                    
+                    // 发送状态更新通知
+                    self.notify_state_update(&atomical_id)?;
                 }
                 AtomicalOperation::Seal { atomical_id } => {
                     self.sealed.insert(atomical_id, true);
+                    
+                    // 发送封印状态变更通知
+                    self.notify_seal_status_change(&atomical_id, true)?;
                 }
                 AtomicalOperation::Transfer { atomical_id, output_index } => {
                     if let Some(output) = self.outputs.get_mut(&atomical_id) {
@@ -124,10 +144,100 @@ impl AtomicalsState {
                         output.height = height;
                         output.timestamp = timestamp;
                     }
+                    
+                    // 发送所有权变更通知
+                    self.notify_ownership_change(&atomical_id, &tx.output[output_index as usize])?;
                 }
             }
         }
+        
+        // 发送操作通知
+        self.notify_operation(&operations, tx.txid().to_string(), Some(height))?;
+        
         Ok(())
+    }
+    
+    // WebSocket 通知方法
+    
+    /// 通知所有权变更
+    fn notify_ownership_change(&self, id: &AtomicalId, new_output: &TxOut) -> Result<()> {
+        let update = AtomicalUpdate {
+            id: id.clone(),
+            info: self.get_atomical_info(id)?,
+            update_type: UpdateType::OwnershipChange,
+        };
+        
+        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
+            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
+            
+        Ok(())
+    }
+    
+    /// 通知状态更新
+    fn notify_state_update(&self, id: &AtomicalId) -> Result<()> {
+        let update = AtomicalUpdate {
+            id: id.clone(),
+            info: self.get_atomical_info(id)?,
+            update_type: UpdateType::StateUpdate,
+        };
+        
+        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
+            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
+            
+        Ok(())
+    }
+    
+    /// 通知封印状态变更
+    fn notify_seal_status_change(&self, id: &AtomicalId, sealed: bool) -> Result<()> {
+        let update = AtomicalUpdate {
+            id: id.clone(),
+            info: self.get_atomical_info(id)?,
+            update_type: UpdateType::SealStatusChange,
+        };
+        
+        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
+            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
+            
+        Ok(())
+    }
+    
+    /// 通知新操作
+    fn notify_operation(&self, operations: &Vec<AtomicalOperation>, txid: String, height: Option<u32>) -> Result<()> {
+        let status = match height {
+            Some(h) => OperationStatus::Confirmed(h),
+            None => OperationStatus::Unconfirmed,
+        };
+        
+        let notification = OperationNotification {
+            txid,
+            operation: operations.clone(),
+            status,
+        };
+        
+        self.broadcast_tx.send(WsMessage::NewOperation(notification))
+            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
+            
+        Ok(())
+    }
+    
+    /// 获取广播发送器
+    pub fn broadcast_tx(&self) -> broadcast::Sender<WsMessage> {
+        self.broadcast_tx.clone()
+    }
+    
+    /// 获取 Atomical 信息
+    fn get_atomical_info(&self, id: &AtomicalId) -> Result<serde_json::Value> {
+        let output = self.outputs.get(id).unwrap();
+        let info = serde_json::json!({
+            "owner": output.owner,
+            "metadata": output.metadata,
+            "location": output.location,
+            "spent": output.spent,
+            "height": output.height,
+            "timestamp": output.timestamp,
+        });
+        
+        Ok(info)
     }
 }
 

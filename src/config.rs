@@ -145,6 +145,12 @@ pub struct Config {
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
     pub signet_magic: Magic,
+    /// WebSocket 服务器端口
+    pub websocket_port: Option<u16>,
+    /// WebSocket 最大连接数
+    pub websocket_max_connections: Option<usize>,
+    /// WebSocket 心跳间隔（秒）
+    pub websocket_heartbeat_interval: Option<u64>,
 }
 
 pub struct SensitiveAuth(pub Auth);
@@ -188,6 +194,37 @@ fn default_config_files() -> Vec<OsString> {
     files
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            network: BitcoinNetwork::default().into(),
+            db_path: default_daemon_dir(),
+            db_log_dir: None,
+            db_parallelism: 1,
+            daemon_auth: SensitiveAuth(Auth::None),
+            daemon_rpc_addr: (DEFAULT_SERVER_ADDRESS, 8332).into(),
+            daemon_p2p_addr: (DEFAULT_SERVER_ADDRESS, 8333).into(),
+            electrum_rpc_addr: (DEFAULT_SERVER_ADDRESS, 50001).into(),
+            monitoring_addr: (DEFAULT_SERVER_ADDRESS, 4224).into(),
+            wait_duration: Duration::from_secs(30),
+            jsonrpc_timeout: Duration::from_secs(30),
+            index_batch_size: 10000,
+            index_lookup_limit: None,
+            reindex_last_blocks: 0,
+            auto_reindex: false,
+            ignore_mempool: false,
+            sync_once: false,
+            skip_block_download_wait: false,
+            disable_electrum_rpc: false,
+            server_banner: "Welcome to electrs!".to_string(),
+            signet_magic: None,
+            websocket_port: Some(8080),
+            websocket_max_connections: Some(1000),
+            websocket_heartbeat_interval: Some(30),
+        }
+    }
+}
+
 impl Config {
     /// Parses args, env vars, config files and post-processes them
     pub fn from_args() -> Config {
@@ -204,14 +241,14 @@ impl Config {
 
         let db_subdir = match config.network {
             Network::Bitcoin => "bitcoin",
-            Network::Testnet => "testnet",
+            Network::Testnet => "testnet3",
             Network::Testnet4 => "testnet4",
             Network::Regtest => "regtest",
             Network::Signet => "signet",
             unsupported => unsupported_network(unsupported),
         };
 
-        config.db_dir.push(db_subdir);
+        config.db_path.push(db_subdir);
 
         let default_daemon_rpc_port = match config.network {
             Network::Bitcoin => 8332,
@@ -287,10 +324,10 @@ impl Config {
 
         match config.network {
             Network::Bitcoin => (),
-            Network::Testnet => config.daemon_dir.push("testnet3"),
-            Network::Testnet4 => config.daemon_dir.push("testnet4"),
-            Network::Regtest => config.daemon_dir.push("regtest"),
-            Network::Signet => config.daemon_dir.push("signet"),
+            Network::Testnet => config.db_path.push("testnet3"),
+            Network::Testnet4 => config.db_path.push("testnet4"),
+            Network::Regtest => config.db_path.push("regtest"),
+            Network::Signet => config.db_path.push("signet"),
             unsupported => unsupported_network(unsupported),
         }
 
@@ -353,7 +390,7 @@ impl Config {
 
         let config = Config {
             network: config.network,
-            db_path: config.db_dir,
+            db_path: config.db_path,
             db_log_dir: config.db_log_dir,
             db_parallelism: config.db_parallelism,
             daemon_auth,
@@ -373,6 +410,9 @@ impl Config {
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
             signet_magic: magic,
+            websocket_port: config.websocket_port,
+            websocket_max_connections: config.websocket_max_connections,
+            websocket_heartbeat_interval: config.websocket_heartbeat_interval,
         };
         eprintln!(
             "Starting electrs {} on {} {} with {:?}",
