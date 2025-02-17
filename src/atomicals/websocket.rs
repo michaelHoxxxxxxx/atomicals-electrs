@@ -686,3 +686,268 @@ impl Default for Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::rand::{self, Rng};
+    use std::time::SystemTime;
+    use tokio::runtime::Runtime;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, Duration};
+    use warp::test::WsClient;
+
+    fn create_test_config() -> Config {
+        Config {
+            jwt_secret: "test_secret".to_string(),
+            max_connections: 100,
+            max_subscriptions_per_connection: 10,
+            connection_timeout: Duration::from_secs(60),
+            compression_level: CompressionLevel::Fast,
+            compression_threshold: 1024,
+            heartbeat_interval: Duration::from_secs(30),
+            cleanup_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn create_test_claims() -> Claims {
+        Claims {
+            sub: "test_user".to_string(),
+            exp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as usize + 3600,
+            permissions: vec!["read".to_string(), "write".to_string()],
+        }
+    }
+
+    fn create_test_atomical_update() -> AtomicalUpdate {
+        AtomicalUpdate {
+            id: AtomicalId {
+                txid: bitcoin::Txid::from_str(
+                    "1234567890123456789012345678901234567890123456789012345678901234"
+                ).unwrap(),
+                vout: 0,
+            },
+            info: AtomicalInfo {
+                id: AtomicalId {
+                    txid: bitcoin::Txid::from_str(
+                        "1234567890123456789012345678901234567890123456789012345678901234"
+                    ).unwrap(),
+                    vout: 0,
+                },
+                atomical_type: AtomicalType::NFT,
+                owner: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                value: 1000,
+                metadata: Some(serde_json::json!({
+                    "name": "Test NFT",
+                    "description": "Test Description"
+                })),
+                created_height: 100,
+                created_timestamp: 1234567890,
+                sealed: false,
+            },
+            update_type: UpdateType::StateUpdate,
+        }
+    }
+
+    #[test]
+    fn test_message_handler() -> Result<()> {
+        let handler = MessageHandler::new(CompressionLevel::Fast, 1024);
+
+        // 测试压缩和解压
+        let test_data = b"Hello, WebSocket!";
+        let compressed = handler.compress(test_data)?;
+        let decompressed = handler.decompress(&compressed)?;
+        assert_eq!(decompressed, Bytes::from(test_data.to_vec()));
+
+        // 测试消息处理
+        let msg = Message::Text("Test message".to_string());
+        let handled = handler.handle_outgoing(msg.clone())?;
+        assert!(matches!(handled, Message::Binary(_)));
+
+        // 测试大消息压缩
+        let large_data = vec![b'x'; 2048];
+        let msg = Message::Binary(large_data.clone());
+        let handled = handler.handle_outgoing(msg)?;
+        assert!(matches!(handled, Message::Binary(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ws_server() -> Result<()> {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = Arc::new(WsServer::new(state, config.clone()));
+
+        // 测试服务器启动
+        let server_clone = Arc::clone(&server);
+        tokio::spawn(async move {
+            server_clone.start(8080).await.unwrap();
+        });
+
+        // 等待服务器启动
+        sleep(Duration::from_millis(100)).await;
+
+        // 创建测试客户端
+        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:8080")
+            .await
+            .unwrap();
+        let (mut write, mut read) = ws_stream.split();
+
+        // 测试认证
+        let auth_msg = WsMessage::Auth(AuthMessage {
+            token: "test_token".to_string(),
+        });
+        let msg = Message::Text(serde_json::to_string(&auth_msg).unwrap());
+        write.send(msg).await.unwrap();
+
+        // 等待认证响应
+        if let Some(response) = read.next().await {
+            let response = response.unwrap();
+            match response {
+                Message::Text(text) => {
+                    let msg: WsMessage = serde_json::from_str(&text).unwrap();
+                    match msg {
+                        WsMessage::AuthResponse(resp) => {
+                            assert!(!resp.success);
+                            assert!(resp.error.is_some());
+                        }
+                        _ => panic!("Expected AuthResponse"),
+                    }
+                }
+                _ => panic!("Expected Text message"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_config() {
+        let config = Config::default();
+        assert_eq!(config.max_connections, 1000);
+        assert_eq!(config.max_subscriptions_per_connection, 100);
+        assert_eq!(config.connection_timeout, Duration::from_secs(300));
+        assert_eq!(config.compression_threshold, 1024);
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(30));
+        assert_eq!(config.cleanup_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_token_verification() -> Result<()> {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = WsServer::new(state, config.clone());
+
+        // 创建有效令牌
+        let claims = create_test_claims();
+        let token = jsonwebtoken::encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        )?;
+
+        // 测试有效令牌
+        let verified_claims = server.verify_token(&token)?;
+        assert_eq!(verified_claims.sub, claims.sub);
+        assert_eq!(verified_claims.permissions, claims.permissions);
+
+        // 测试无效令牌
+        assert!(server.verify_token("invalid_token").is_err());
+
+        // 测试过期令牌
+        let mut expired_claims = claims;
+        expired_claims.exp = 0;
+        let expired_token = jsonwebtoken::encode(
+            &Header::default(),
+            &expired_claims,
+            &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        )?;
+        assert!(server.verify_token(&expired_token).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_permission_check() {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = WsServer::new(state, config);
+
+        let claims = create_test_claims();
+
+        // 测试有权限
+        assert!(server.check_permission(&claims, "read"));
+        assert!(server.check_permission(&claims, "write"));
+
+        // 测试无权限
+        assert!(!server.check_permission(&claims, "admin"));
+    }
+
+    #[tokio::test]
+    async fn test_subscription_handling() -> Result<()> {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = Arc::new(WsServer::new(state, config.clone()));
+
+        // 测试订阅请求
+        let req = SubscribeRequest {
+            subscription_type: SubscriptionType::AllOperations,
+            params: serde_json::json!({}),
+        };
+
+        let sub_id = server.handle_subscribe(&req)?;
+        assert!(!sub_id.is_empty());
+
+        // 测试超出最大订阅数
+        for _ in 0..config.max_subscriptions_per_connection {
+            let req = SubscribeRequest {
+                subscription_type: SubscriptionType::AllOperations,
+                params: serde_json::json!({}),
+            };
+            server.handle_subscribe(&req)?;
+        }
+
+        let req = SubscribeRequest {
+            subscription_type: SubscriptionType::AllOperations,
+            params: serde_json::json!({}),
+        };
+        assert!(server.handle_subscribe(&req).is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_broadcast() -> Result<()> {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = Arc::new(WsServer::new(state, config));
+
+        // 创建测试消息
+        let update = create_test_atomical_update();
+        let msg = WsMessage::AtomicalUpdate(update);
+
+        // 测试广播
+        server.broadcast(msg.clone())?;
+
+        // 测试无连接时的广播
+        assert!(server.broadcast(msg).is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metrics() {
+        let config = create_test_config();
+        let state = Arc::new(AtomicalsState::new());
+        let server = WsServer::new(state, config);
+
+        let metrics = server.get_metrics();
+        assert!(metrics.get("connections").is_some());
+        assert!(metrics.get("subscriptions").is_some());
+        assert!(metrics.get("messages_sent").is_some());
+        assert!(metrics.get("messages_received").is_some());
+    }
+}

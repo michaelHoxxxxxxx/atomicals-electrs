@@ -139,6 +139,9 @@ impl AtomicalsRpc {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::secp256k1::rand::{self, Rng};
+    use std::collections::HashMap;
 
     fn create_test_rpc() -> AtomicalsRpc {
         let network = Network::Regtest;
@@ -147,18 +150,68 @@ mod tests {
         AtomicalsRpc::new(network, state, storage)
     }
 
+    fn create_test_atomical_id() -> AtomicalId {
+        AtomicalId {
+            txid: Txid::from_str(
+                "1234567890123456789012345678901234567890123456789012345678901234"
+            ).unwrap(),
+            vout: 0,
+        }
+    }
+
+    fn create_test_address() -> String {
+        "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string()
+    }
+
+    fn create_test_script() -> Vec<u8> {
+        let mut rng = rand::thread_rng();
+        let mut script = vec![0; 32];
+        rng.fill(&mut script[..]);
+        script
+    }
+
     #[test]
     fn test_get_atomical_info() -> Result<()> {
         let rpc = create_test_rpc();
-        let id = AtomicalId {
-            txid: Txid::from_str(
-                "1234567890123456789012345678901234567890123456789012345678901234"
-            )?,
-            vout: 0,
-        };
+        let id = create_test_atomical_id();
 
         // 测试不存在的 Atomical
         assert!(rpc.get_atomical_info(&id).is_err());
+
+        // 创建一个测试 Atomical
+        let script = create_test_script();
+        let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: script.clone(),
+                value: 1000,
+            },
+            atomical_id: id.clone(),
+            metadata: Some(json!({
+                "name": "Test NFT",
+                "description": "Test Description"
+            })),
+            height: 100,
+            timestamp: 1234567890,
+        };
+
+        // 添加到状态
+        rpc.state.add_atomical(&id, AtomicalType::NFT)?;
+        rpc.state.update_output(&id, &output)?;
+        rpc.state.set_metadata(&id, output.metadata.as_ref().unwrap())?;
+
+        // 测试获取信息
+        let info = rpc.get_atomical_info(&id)?;
+        assert_eq!(info.id, id);
+        assert_eq!(info.atomical_type, AtomicalType::NFT);
+        assert_eq!(info.value, 1000);
+        assert_eq!(info.created_height, 100);
+        assert_eq!(info.created_timestamp, 1234567890);
+        assert!(!info.sealed);
+
+        // 测试元数据
+        let metadata = info.metadata.unwrap();
+        assert_eq!(metadata["name"], "Test NFT");
+        assert_eq!(metadata["description"], "Test Description");
 
         Ok(())
     }
@@ -166,11 +219,226 @@ mod tests {
     #[test]
     fn test_get_atomicals_by_address() -> Result<()> {
         let rpc = create_test_rpc();
-        let address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let address = create_test_address();
+        let id = create_test_atomical_id();
+
+        // 测试空地址
+        let atomicals = rpc.get_atomicals_by_address(&address)?;
+        assert!(atomicals.is_empty());
+
+        // 创建一个测试 Atomical 并关联到地址
+        let addr = Address::from_str(&address)?;
+        let script = addr.script_pubkey();
+        let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: script.as_bytes().to_vec(),
+                value: 1000,
+            },
+            atomical_id: id.clone(),
+            metadata: Some(json!({
+                "name": "Test NFT",
+                "description": "Test Description"
+            })),
+            height: 100,
+            timestamp: 1234567890,
+        };
+
+        // 添加到状态
+        rpc.state.add_atomical(&id, AtomicalType::NFT)?;
+        rpc.state.update_output(&id, &output)?;
+        rpc.state.set_metadata(&id, output.metadata.as_ref().unwrap())?;
+
+        // 添加到存储
+        rpc.storage.store_output(&id, &output)?;
 
         // 测试地址查询
-        let atomicals = rpc.get_atomicals_by_address(address)?;
-        assert!(atomicals.is_empty());
+        let atomicals = rpc.get_atomicals_by_address(&address)?;
+        assert_eq!(atomicals.len(), 1);
+        assert_eq!(atomicals[0].id, id);
+        assert_eq!(atomicals[0].value, 1000);
+
+        // 测试无效地址
+        assert!(rpc.get_atomicals_by_address("invalid_address").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_pending_operations() -> Result<()> {
+        let rpc = create_test_rpc();
+        let id = create_test_atomical_id();
+
+        // 创建一些测试操作
+        let operations = vec![
+            AtomicalOperation::Mint {
+                atomical_type: AtomicalType::NFT,
+                metadata: json!({"name": "Test NFT 1"}),
+            },
+            AtomicalOperation::Update {
+                atomical_id: id.clone(),
+                metadata: json!({"name": "Updated NFT"}),
+            },
+        ];
+
+        // 添加到待处理操作
+        let txid = Txid::from_str(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        )?;
+        rpc.state.add_pending_operations(txid, operations.clone())?;
+
+        // 测试获取待处理操作
+        let pending = rpc.get_pending_operations()?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[&txid].len(), 2);
+
+        // 验证操作内容
+        match &pending[&txid][0] {
+            AtomicalOperation::Mint { atomical_type, metadata } => {
+                assert_eq!(*atomical_type, AtomicalType::NFT);
+                assert_eq!(metadata["name"], "Test NFT 1");
+            }
+            _ => panic!("Expected Mint operation"),
+        }
+
+        match &pending[&txid][1] {
+            AtomicalOperation::Update { atomical_id, metadata } => {
+                assert_eq!(*atomical_id, id);
+                assert_eq!(metadata["name"], "Updated NFT");
+            }
+            _ => panic!("Expected Update operation"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_atomicals() -> Result<()> {
+        let rpc = create_test_rpc();
+        let id = create_test_atomical_id();
+
+        // 创建一些测试 Atomicals
+        let metadata1 = json!({
+            "name": "Test NFT 1",
+            "description": "First test NFT",
+            "attributes": [{"trait_type": "Color", "value": "Blue"}]
+        });
+
+        let metadata2 = json!({
+            "name": "Test NFT 2",
+            "description": "Second test NFT",
+            "attributes": [{"trait_type": "Color", "value": "Red"}]
+        });
+
+        // 添加到状态和存储
+        let script = create_test_script();
+        let output1 = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: script.clone(),
+                value: 1000,
+            },
+            atomical_id: id.clone(),
+            metadata: Some(metadata1.clone()),
+            height: 100,
+            timestamp: 1234567890,
+        };
+
+        let id2 = AtomicalId {
+            txid: Txid::from_str(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            )?,
+            vout: 0,
+        };
+
+        let output2 = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: script,
+                value: 2000,
+            },
+            atomical_id: id2.clone(),
+            metadata: Some(metadata2.clone()),
+            height: 101,
+            timestamp: 1234567891,
+        };
+
+        // 添加到状态
+        rpc.state.add_atomical(&id, AtomicalType::NFT)?;
+        rpc.state.update_output(&id, &output1)?;
+        rpc.state.set_metadata(&id, &metadata1)?;
+
+        rpc.state.add_atomical(&id2, AtomicalType::NFT)?;
+        rpc.state.update_output(&id2, &output2)?;
+        rpc.state.set_metadata(&id2, &metadata2)?;
+
+        // 添加到存储
+        rpc.storage.store_output(&id, &output1)?;
+        rpc.storage.store_metadata(&id, &metadata1)?;
+        rpc.storage.store_output(&id2, &output2)?;
+        rpc.storage.store_metadata(&id2, &metadata2)?;
+
+        // 测试搜索
+        let results = rpc.search_atomicals("Blue")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+
+        let results = rpc.search_atomicals("Red")?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id2);
+
+        let results = rpc.search_atomicals("Test NFT")?;
+        assert_eq!(results.len(), 2);
+
+        // 测试空搜索
+        let results = rpc.search_atomicals("NonExistent")?;
+        assert!(results.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_stats() -> Result<()> {
+        let rpc = create_test_rpc();
+        let id1 = create_test_atomical_id();
+        let id2 = AtomicalId {
+            txid: Txid::from_str(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            )?,
+            vout: 0,
+        };
+
+        // 添加一些测试数据
+        rpc.state.add_atomical(&id1, AtomicalType::NFT)?;
+        rpc.state.add_atomical(&id2, AtomicalType::FT)?;
+        rpc.state.seal_atomical(&id1)?;
+
+        // 测试统计信息
+        let stats = rpc.get_stats()?;
+        assert_eq!(stats["total_atomicals"], 2);
+        assert_eq!(stats["total_nft"], 1);
+        assert_eq!(stats["total_ft"], 1);
+        assert_eq!(stats["total_sealed"], 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_cases() -> Result<()> {
+        let rpc = create_test_rpc();
+
+        // 测试无效的 Atomical ID
+        let invalid_id = AtomicalId {
+            txid: Txid::from_str(
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )?,
+            vout: 0,
+        };
+        assert!(rpc.get_atomical_info(&invalid_id).is_err());
+
+        // 测试无效的地址
+        assert!(rpc.get_atomicals_by_address("invalid_address").is_err());
+
+        // 测试无效的搜索查询
+        let results = rpc.search_atomicals("")?;
+        assert!(results.is_empty());
 
         Ok(())
     }

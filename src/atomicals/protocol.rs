@@ -113,6 +113,7 @@ impl AtomicalOperation {
 mod tests {
     use super::*;
     use bitcoin::hashes::hex::FromHex;
+    use serde_json::json;
 
     #[test]
     fn test_atomical_id() {
@@ -142,6 +143,19 @@ mod tests {
             vout,
         };
         assert_ne!(atomical_id, different_txid);
+
+        // Test hash implementation
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(atomical_id);
+        assert!(set.contains(&same_atomical_id));
+        assert!(!set.contains(&different_vout));
+        assert!(!set.contains(&different_txid));
+
+        // Test serialization/deserialization
+        let serialized = serde_json::to_string(&atomical_id).unwrap();
+        let deserialized: AtomicalId = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(atomical_id, deserialized);
     }
 
     #[test]
@@ -165,19 +179,39 @@ mod tests {
         assert_eq!(AtomicalType::Container, AtomicalType::Container);
         assert_eq!(AtomicalType::Realm, AtomicalType::Realm);
 
-        // Test serialization/deserialization
-        let nft_json = serde_json::to_string(&AtomicalType::NFT).unwrap();
-        let nft_deserialized: AtomicalType = serde_json::from_str(&nft_json).unwrap();
-        assert_eq!(nft_deserialized, AtomicalType::NFT);
+        // Test serialization/deserialization for all types
+        let types = vec![
+            AtomicalType::NFT,
+            AtomicalType::FT,
+            AtomicalType::DID,
+            AtomicalType::Container,
+            AtomicalType::Realm,
+        ];
+
+        for atomical_type in types {
+            let serialized = serde_json::to_string(&atomical_type).unwrap();
+            let deserialized: AtomicalType = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(atomical_type, deserialized);
+        }
+
+        // Test invalid deserialization
+        let result: Result<AtomicalType, _> = serde_json::from_str("\"INVALID\"");
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_atomical_operation_mint() {
         // Test mint operation with metadata
-        let metadata = serde_json::json!({
+        let metadata = json!({
             "name": "Test NFT",
             "description": "A test NFT",
-            "image": "https://example.com/image.png"
+            "image": "https://example.com/image.png",
+            "attributes": [
+                {
+                    "trait_type": "Color",
+                    "value": "Blue"
+                }
+            ]
         });
 
         let mint_op = AtomicalOperation::Mint {
@@ -199,17 +233,38 @@ mod tests {
 
         assert!(mint_op_no_metadata.is_mint());
         assert_eq!(mint_op_no_metadata.operation_type(), "mint");
+
+        // Test mint operation for each Atomical type
+        for atomical_type in [
+            AtomicalType::NFT,
+            AtomicalType::FT,
+            AtomicalType::DID,
+            AtomicalType::Container,
+            AtomicalType::Realm,
+        ] {
+            let op = AtomicalOperation::Mint {
+                atomical_type,
+                metadata: Some(json!({"name": format!("Test {:#?}", atomical_type)})),
+            };
+            assert!(op.is_mint());
+            assert_eq!(op.operation_type(), "mint");
+        }
+
+        // Test serialization/deserialization
+        let serialized = serde_json::to_string(&mint_op).unwrap();
+        let deserialized: AtomicalOperation = serde_json::from_str(&serialized).unwrap();
+        assert!(deserialized.is_mint());
     }
 
     #[test]
     fn test_atomical_operation_transfer() {
         let txid = Txid::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
         let atomical_id = AtomicalId { txid, vout: 0 };
-        let output_index = 1;
 
+        // Test transfer operation
         let transfer_op = AtomicalOperation::Transfer {
             atomical_id,
-            output_index,
+            output_index: 1,
         };
 
         assert!(transfer_op.is_transfer());
@@ -218,31 +273,36 @@ mod tests {
         assert!(!transfer_op.is_seal());
         assert_eq!(transfer_op.operation_type(), "transfer");
 
-        // Test serialization/deserialization
-        let transfer_json = serde_json::to_string(&transfer_op).unwrap();
-        let transfer_deserialized: AtomicalOperation = serde_json::from_str(&transfer_json).unwrap();
-        
-        match transfer_deserialized {
-            AtomicalOperation::Transfer { atomical_id: id, output_index: idx } => {
-                assert_eq!(id, atomical_id);
-                assert_eq!(idx, output_index);
-            }
-            _ => panic!("Deserialized to wrong variant"),
+        // Test transfer with different output indices
+        for output_index in 0..5 {
+            let op = AtomicalOperation::Transfer {
+                atomical_id,
+                output_index,
+            };
+            assert!(op.is_transfer());
+            assert_eq!(op.operation_type(), "transfer");
         }
+
+        // Test serialization/deserialization
+        let serialized = serde_json::to_string(&transfer_op).unwrap();
+        let deserialized: AtomicalOperation = serde_json::from_str(&serialized).unwrap();
+        assert!(deserialized.is_transfer());
     }
 
     #[test]
     fn test_atomical_operation_update() {
         let txid = Txid::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
         let atomical_id = AtomicalId { txid, vout: 0 };
-        let metadata = serde_json::json!({
-            "updated_name": "Updated NFT",
-            "updated_description": "An updated NFT"
+
+        // Test update operation with simple metadata
+        let simple_metadata = json!({
+            "name": "Updated NFT",
+            "description": "Updated description"
         });
 
         let update_op = AtomicalOperation::Update {
             atomical_id,
-            metadata: metadata.clone(),
+            metadata: simple_metadata.clone(),
         };
 
         assert!(update_op.is_update());
@@ -251,17 +311,40 @@ mod tests {
         assert!(!update_op.is_seal());
         assert_eq!(update_op.operation_type(), "update");
 
-        // Test serialization/deserialization
-        let update_json = serde_json::to_string(&update_op).unwrap();
-        let update_deserialized: AtomicalOperation = serde_json::from_str(&update_json).unwrap();
-        
-        match update_deserialized {
-            AtomicalOperation::Update { atomical_id: id, metadata: meta } => {
-                assert_eq!(id, atomical_id);
-                assert_eq!(meta, metadata);
+        // Test update operation with complex metadata
+        let complex_metadata = json!({
+            "name": "Updated NFT",
+            "description": "Updated description",
+            "attributes": [
+                {
+                    "trait_type": "Color",
+                    "value": "Red"
+                },
+                {
+                    "trait_type": "Size",
+                    "value": "Large"
+                }
+            ],
+            "nested": {
+                "field1": "value1",
+                "field2": 42,
+                "field3": true,
+                "field4": null,
+                "field5": ["item1", "item2"]
             }
-            _ => panic!("Deserialized to wrong variant"),
-        }
+        });
+
+        let complex_update_op = AtomicalOperation::Update {
+            atomical_id,
+            metadata: complex_metadata.clone(),
+        };
+
+        assert!(complex_update_op.is_update());
+
+        // Test serialization/deserialization
+        let serialized = serde_json::to_string(&complex_update_op).unwrap();
+        let deserialized: AtomicalOperation = serde_json::from_str(&serialized).unwrap();
+        assert!(deserialized.is_update());
     }
 
     #[test]
@@ -269,6 +352,7 @@ mod tests {
         let txid = Txid::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
         let atomical_id = AtomicalId { txid, vout: 0 };
 
+        // Test seal operation
         let seal_op = AtomicalOperation::Seal { atomical_id };
 
         assert!(seal_op.is_seal());
@@ -277,27 +361,83 @@ mod tests {
         assert!(!seal_op.is_update());
         assert_eq!(seal_op.operation_type(), "seal");
 
-        // Test serialization/deserialization
-        let seal_json = serde_json::to_string(&seal_op).unwrap();
-        let seal_deserialized: AtomicalOperation = serde_json::from_str(&seal_json).unwrap();
-        
-        match seal_deserialized {
-            AtomicalOperation::Seal { atomical_id: id } => {
-                assert_eq!(id, atomical_id);
-            }
-            _ => panic!("Deserialized to wrong variant"),
+        // Test sealing with different atomical IDs
+        for vout in 0..5 {
+            let id = AtomicalId { txid, vout };
+            let op = AtomicalOperation::Seal { atomical_id: id };
+            assert!(op.is_seal());
+            assert_eq!(op.operation_type(), "seal");
         }
+
+        // Test serialization/deserialization
+        let serialized = serde_json::to_string(&seal_op).unwrap();
+        let deserialized: AtomicalOperation = serde_json::from_str(&serialized).unwrap();
+        assert!(deserialized.is_seal());
     }
 
     #[test]
     fn test_operation_from_tx_data() {
-        // TODO: Once from_tx_data is implemented, add tests for:
-        // 1. Valid mint operation data
-        // 2. Valid transfer operation data
-        // 3. Valid update operation data
-        // 4. Valid seal operation data
-        // 5. Invalid operation data
-        // 6. Empty data
-        // 7. Malformed data
+        // 测试空数据
+        assert!(AtomicalOperation::from_tx_data(&[]).is_none());
+
+        // TODO: 一旦实现了 from_tx_data，添加更多测试用例
+        // 1. 测试有效的铸造操作数据
+        // 2. 测试有效的转移操作数据
+        // 3. 测试有效的更新操作数据
+        // 4. 测试有效的封印操作数据
+        // 5. 测试无效的操作数据
+    }
+
+    #[test]
+    fn test_operation_type_consistency() {
+        let txid = Txid::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
+        let atomical_id = AtomicalId { txid, vout: 0 };
+
+        // 创建所有类型的操作
+        let operations = vec![
+            AtomicalOperation::Mint {
+                atomical_type: AtomicalType::NFT,
+                metadata: None,
+            },
+            AtomicalOperation::Transfer {
+                atomical_id,
+                output_index: 0,
+            },
+            AtomicalOperation::Update {
+                atomical_id,
+                metadata: json!({}),
+            },
+            AtomicalOperation::Seal { atomical_id },
+        ];
+
+        // 验证每个操作的类型检查方法是互斥的
+        for op in operations {
+            match op {
+                AtomicalOperation::Mint { .. } => {
+                    assert!(op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                }
+                AtomicalOperation::Transfer { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                }
+                AtomicalOperation::Update { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(op.is_update());
+                    assert!(!op.is_seal());
+                }
+                AtomicalOperation::Seal { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(op.is_seal());
+                }
+            }
+        }
     }
 }

@@ -140,12 +140,33 @@ fn validate_seal(state: &AtomicalsState, tx: &Transaction, atomical_id: &Atomica
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use bitcoin::{Amount, TxOut, Transaction};
+    use bitcoin::script::Builder;
     
     fn create_test_atomical_id() -> AtomicalId {
         let txid = bitcoin::Txid::from_str(
             "1234567890123456789012345678901234567890123456789012345678901234"
         ).unwrap();
         AtomicalId { txid, vout: 0 }
+    }
+
+    fn create_test_transaction() -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1000).to_sat(),
+                    script_pubkey: Builder::new().into_script(),
+                }
+            ],
+        }
+    }
+
+    fn create_test_state() -> AtomicalsState {
+        // 创建一个模拟的状态对象
+        AtomicalsState::new()
     }
     
     #[test]
@@ -165,6 +186,27 @@ mod tests {
         });
         assert!(validate_mint(&AtomicalType::FT, &ft_metadata).is_ok());
         
+        // 测试 DID 铸造
+        let did_metadata = serde_json::json!({
+            "did": "did:example:123",
+            "description": "Test DID",
+        });
+        assert!(validate_mint(&AtomicalType::DID, &did_metadata).is_ok());
+
+        // 测试 Container 铸造
+        let container_metadata = serde_json::json!({
+            "container_name": "test_container",
+            "description": "Test Container",
+        });
+        assert!(validate_mint(&AtomicalType::Container, &container_metadata).is_ok());
+
+        // 测试 Realm 铸造
+        let realm_metadata = serde_json::json!({
+            "realm_name": "test_realm",
+            "description": "Test Realm",
+        });
+        assert!(validate_mint(&AtomicalType::Realm, &realm_metadata).is_ok());
+        
         // 测试无效的 NFT 元数据
         let invalid_nft_metadata = serde_json::json!({
             "description": "Missing name field",
@@ -176,5 +218,135 @@ mod tests {
             "description": "Missing ticker and max_supply fields",
         });
         assert!(validate_mint(&AtomicalType::FT, &invalid_ft_metadata).is_err());
+
+        // 测试无效的 DID 元数据
+        let invalid_did_metadata = serde_json::json!({
+            "description": "Missing did field",
+        });
+        assert!(validate_mint(&AtomicalType::DID, &invalid_did_metadata).is_err());
+
+        // 测试无效的 Container 元数据
+        let invalid_container_metadata = serde_json::json!({
+            "description": "Missing container_name field",
+        });
+        assert!(validate_mint(&AtomicalType::Container, &invalid_container_metadata).is_err());
+
+        // 测试无效的 Realm 元数据
+        let invalid_realm_metadata = serde_json::json!({
+            "description": "Missing realm_name field",
+        });
+        assert!(validate_mint(&AtomicalType::Realm, &invalid_realm_metadata).is_err());
+
+        // 测试非对象元数据
+        let invalid_metadata = serde_json::json!("not an object");
+        assert!(validate_mint(&AtomicalType::NFT, &invalid_metadata).is_err());
+    }
+
+    #[test]
+    fn test_validate_update() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let atomical_id = create_test_atomical_id();
+
+        // 测试更新不存在的 Atomical
+        assert!(validate_update(&state, &tx, &atomical_id).is_err());
+
+        // 模拟 Atomical 存在
+        state.create(&atomical_id, AtomicalType::NFT).unwrap();
+        assert!(validate_update(&state, &tx, &atomical_id).is_ok());
+
+        // 测试更新已封印的 Atomical
+        state.seal(&atomical_id).unwrap();
+        assert!(validate_update(&state, &tx, &atomical_id).is_err());
+    }
+
+    #[test]
+    fn test_validate_seal() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let atomical_id = create_test_atomical_id();
+
+        // 测试封印不存在的 Atomical
+        assert!(validate_seal(&state, &tx, &atomical_id).is_err());
+
+        // 模拟 Atomical 存在
+        state.create(&atomical_id, AtomicalType::NFT).unwrap();
+        assert!(validate_seal(&state, &tx, &atomical_id).is_ok());
+
+        // 测试重复封印
+        state.seal(&atomical_id).unwrap();
+        assert!(validate_seal(&state, &tx, &atomical_id).is_err());
+    }
+
+    #[test]
+    fn test_validate_transfer() {
+        let state = create_test_state();
+        let mut tx = create_test_transaction();
+        let atomical_id = create_test_atomical_id();
+
+        // 测试转移不存在的 Atomical
+        assert!(validate_operation(
+            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &tx,
+            &state
+        ).is_err());
+
+        // 模拟 Atomical 存在
+        state.create(&atomical_id, AtomicalType::NFT).unwrap();
+        assert!(validate_operation(
+            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &tx,
+            &state
+        ).is_ok());
+
+        // 测试无效的输出索引
+        assert!(validate_operation(
+            &AtomicalOperation::Transfer { atomical_id, output_index: 1 },
+            &tx,
+            &state
+        ).is_err());
+
+        // 测试转移已封印的 Atomical
+        state.seal(&atomical_id).unwrap();
+        assert!(validate_operation(
+            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &tx,
+            &state
+        ).is_err());
+    }
+
+    #[test]
+    fn test_validator() {
+        let state = create_test_state();
+        let validator = AtomicalsValidator::new(state);
+        let tx = create_test_transaction();
+        let atomical_id = create_test_atomical_id();
+
+        // 测试铸造操作
+        let mint_op = AtomicalOperation::Mint {
+            atomical_type: AtomicalType::NFT,
+            metadata: serde_json::json!({
+                "name": "Test NFT",
+                "description": "Test Description",
+            }),
+        };
+        assert!(validator.validate_operation(&tx, &mint_op).is_ok());
+
+        // 测试无效的铸造操作
+        let invalid_mint_op = AtomicalOperation::Mint {
+            atomical_type: AtomicalType::NFT,
+            metadata: serde_json::json!({
+                "description": "Missing name field",
+            }),
+        };
+        assert!(validator.validate_operation(&tx, &invalid_mint_op).is_err());
+
+        // 测试转移操作
+        validator.state.create(&atomical_id, AtomicalType::NFT).unwrap();
+        let transfer_op = AtomicalOperation::Transfer {
+            atomical_id,
+            output_index: 0,
+        };
+        assert!(validator.validate_operation(&tx, &transfer_op).is_ok());
     }
 }

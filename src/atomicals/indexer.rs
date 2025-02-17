@@ -232,49 +232,283 @@ impl AtomicalsIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::Network;
+    use bitcoin::secp256k1::rand::{self, Rng};
+    use serde_json::json;
     use std::str::FromStr;
-    use tempfile::TempDir;
 
     fn create_test_storage() -> AtomicalsStorage {
-        let temp_dir = TempDir::new().unwrap();
-        AtomicalsStorage::new(temp_dir.path()).unwrap()
+        AtomicalsStorage::new_test().unwrap()
     }
 
     fn create_test_atomical_id() -> AtomicalId {
-        let txid = bitcoin::Txid::from_str(
-            "1234567890123456789012345678901234567890123456789012345678901234"
-        ).unwrap();
-        AtomicalId { txid, vout: 0 }
+        AtomicalId {
+            txid: bitcoin::Txid::from_str(
+                "1234567890123456789012345678901234567890123456789012345678901234"
+            ).unwrap(),
+            vout: 0,
+        }
     }
 
-    fn create_test_index_entry() -> IndexEntry {
+    fn create_test_address() -> Address {
+        Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap()
+    }
+
+    fn create_test_index_entry(index_type: IndexType, key: &str) -> IndexEntry {
         IndexEntry {
-            index_type: IndexType::Address,
-            key: "bc1qtest".to_string(),
+            index_type,
+            key: key.to_string(),
             atomical_id: create_test_atomical_id(),
-            timestamp: 1644900000,
+            timestamp: 1234567890,
+        }
+    }
+
+    fn create_test_output(atomical_id: &AtomicalId, value: u64) -> AtomicalOutput {
+        let mut rng = rand::thread_rng();
+        let mut script = vec![0; 32];
+        rng.fill(&mut script[..]);
+
+        AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: script,
+                value,
+            },
+            atomical_id: atomical_id.clone(),
+            metadata: Some(json!({
+                "name": "Test NFT",
+                "description": "Test Description"
+            })),
+            height: 100,
+            timestamp: 1234567890,
         }
     }
 
     #[test]
-    fn test_indexer() -> Result<()> {
-        let storage = create_test_storage();
-        let indexer = AtomicalsIndexer::new(storage);
-        
-        // 测试添加索引
-        let entry = create_test_index_entry();
+    fn test_add_index() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let entry = create_test_index_entry(IndexType::Address, "test_address");
+
+        // 测试添加单个索引
         indexer.add_index(entry.clone())?;
-        
+
+        // 验证缓存
+        let key = indexer.create_index_key(&entry);
+        let cached = indexer.cache.get(&key).unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].key, "test_address");
+
+        // 验证存储
+        let stored = indexer.storage.get_index(&key)?;
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().key, "test_address");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_indexes() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let entries = vec![
+            create_test_index_entry(IndexType::Address, "address1"),
+            create_test_index_entry(IndexType::Type, "NFT"),
+            create_test_index_entry(IndexType::Metadata, "name:test"),
+        ];
+
+        // 测试批量添加
+        indexer.add_indexes(&entries)?;
+
+        // 验证每个索引
+        for entry in entries {
+            let key = indexer.create_index_key(&entry);
+            let cached = indexer.cache.get(&key).unwrap();
+            assert_eq!(cached.len(), 1);
+            
+            let stored = indexer.storage.get_index(&key)?;
+            assert!(stored.is_some());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_by_address() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let address = create_test_address();
+        let id = create_test_atomical_id();
+
+        // 创建测试数据
+        let entry = create_test_index_entry(IndexType::Address, &address.to_string());
+        let output = create_test_output(&id, 1000);
+
+        // 添加到索引和存储
+        indexer.add_index(entry)?;
+        indexer.storage.store_output(&id, &output)?;
+
         // 测试查询
-        let address = Address::from_str("bc1qtest").unwrap();
         let outputs = indexer.find_by_address(&address)?;
-        assert!(outputs.is_empty()); // 因为我们没有添加对应的输出
-        
-        // 测试统计
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].atomical_id, id);
+        assert_eq!(outputs[0].owner.value, 1000);
+
+        // 测试不存在的地址
+        let nonexistent = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt081")?;
+        let outputs = indexer.find_by_address(&nonexistent)?;
+        assert!(outputs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_by_type() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let id = create_test_atomical_id();
+
+        // 创建测试数据
+        let entry = create_test_index_entry(IndexType::Type, "NFT");
+        let output = create_test_output(&id, 1000);
+
+        // 添加到索引和存储
+        indexer.add_index(entry)?;
+        indexer.storage.store_output(&id, &output)?;
+
+        // 测试查询
+        let outputs = indexer.find_by_type(AtomicalType::NFT)?;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].atomical_id, id);
+
+        // 测试不存在的类型
+        let outputs = indexer.find_by_type(AtomicalType::FT)?;
+        assert!(outputs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_by_metadata() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let id = create_test_atomical_id();
+
+        // 创建测试数据
+        let entry = create_test_index_entry(IndexType::Metadata, "name:Test NFT");
+        let output = create_test_output(&id, 1000);
+
+        // 添加到索引和存储
+        indexer.add_index(entry)?;
+        indexer.storage.store_output(&id, &output)?;
+
+        // 测试查询
+        let outputs = indexer.find_by_metadata("name", "Test NFT")?;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].atomical_id, id);
+
+        // 测试不存在的元数据
+        let outputs = indexer.find_by_metadata("name", "Nonexistent")?;
+        assert!(outputs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_by_time_range() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+        let id = create_test_atomical_id();
+
+        // 创建测试数据
+        let entry = create_test_index_entry(IndexType::Timestamp, "1234567890");
+        let output = create_test_output(&id, 1000);
+
+        // 添加到索引和存储
+        indexer.add_index(entry)?;
+        indexer.storage.store_output(&id, &output)?;
+
+        // 测试时间范围查询
+        let outputs = indexer.find_by_time_range(1234567880, 1234567900)?;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].atomical_id, id);
+
+        // 测试不在范围内
+        let outputs = indexer.find_by_time_range(1234567900, 1234567910)?;
+        assert!(outputs.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_stats() -> Result<()> {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+
+        // 添加测试数据
+        let entries = vec![
+            create_test_index_entry(IndexType::Address, "address1"),
+            create_test_index_entry(IndexType::Type, "NFT"),
+            create_test_index_entry(IndexType::Metadata, "name:test"),
+            create_test_index_entry(IndexType::Timestamp, "1234567890"),
+        ];
+
+        indexer.add_indexes(&entries)?;
+
+        // 测试统计信息
         let stats = indexer.get_stats();
-        assert_eq!(stats.total_count, 1);
+        assert_eq!(stats.total_count, 4);
         assert_eq!(*stats.counts.get(&IndexType::Address).unwrap(), 1);
-        
+        assert_eq!(*stats.counts.get(&IndexType::Type).unwrap(), 1);
+        assert_eq!(*stats.counts.get(&IndexType::Metadata).unwrap(), 1);
+        assert_eq!(*stats.counts.get(&IndexType::Timestamp).unwrap(), 1);
+        assert!(stats.size_bytes > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_index_key() {
+        let indexer = AtomicalsIndexer::new(create_test_storage());
+
+        // 测试不同类型的索引键生成
+        let address_entry = create_test_index_entry(IndexType::Address, "test_address");
+        assert_eq!(indexer.create_index_key(&address_entry), "address:test_address");
+
+        let type_entry = create_test_index_entry(IndexType::Type, "NFT");
+        assert_eq!(indexer.create_index_key(&type_entry), "type:NFT");
+
+        let metadata_entry = create_test_index_entry(IndexType::Metadata, "name:test");
+        assert_eq!(indexer.create_index_key(&metadata_entry), "metadata:name:test");
+
+        let timestamp_entry = create_test_index_entry(IndexType::Timestamp, "1234567890");
+        assert_eq!(indexer.create_index_key(&timestamp_entry), "timestamp:1234567890");
+    }
+
+    #[test]
+    fn test_concurrent_operations() -> Result<()> {
+        use std::thread;
+        use std::sync::Arc;
+
+        let indexer = Arc::new(AtomicalsIndexer::new(create_test_storage()));
+        let mut handles = vec![];
+
+        // 创建多个线程并发添加索引
+        for i in 0..10 {
+            let indexer = Arc::clone(&indexer);
+            let handle = thread::spawn(move || -> Result<()> {
+                let entry = create_test_index_entry(
+                    IndexType::Address,
+                    &format!("address{}", i)
+                );
+                indexer.add_index(entry)
+            });
+            handles.push(handle);
+        }
+
+        // 等待所有线程完成
+        for handle in handles {
+            handle.join().unwrap()?;
+        }
+
+        // 验证结果
+        let stats = indexer.get_stats();
+        assert_eq!(stats.total_count, 10);
+        assert_eq!(*stats.counts.get(&IndexType::Address).unwrap(), 10);
+
         Ok(())
     }
 }

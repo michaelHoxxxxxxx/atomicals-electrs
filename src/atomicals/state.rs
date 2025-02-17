@@ -244,6 +244,8 @@ impl AtomicalsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::{Amount, TxOut, Transaction};
+    use bitcoin::script::Builder;
     use std::str::FromStr;
 
     fn create_test_atomical_id() -> AtomicalId {
@@ -253,47 +255,288 @@ mod tests {
         AtomicalId { txid, vout: 0 }
     }
 
+    fn create_test_transaction() -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1000).to_sat(),
+                    script_pubkey: Builder::new().into_script(),
+                }
+            ],
+        }
+    }
+
     #[test]
-    fn test_state() -> Result<()> {
-        let mut state = AtomicalsState::new();
+    fn test_state_creation() -> Result<()> {
+        let state = AtomicalsState::new()?;
+        assert!(state.outputs.is_empty());
+        assert!(state.sealed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomical_existence() -> Result<()> {
+        let state = AtomicalsState::new()?;
         let atomical_id = create_test_atomical_id();
 
-        // 测试存在性检查
+        // 测试不存在的 Atomical
         assert!(!state.exists(&atomical_id)?);
 
-        // 创建测试输出
+        // 添加 Atomical
         let output = AtomicalOutput {
             owner: OwnerInfo {
                 script_pubkey: vec![],
                 value: 1000,
             },
             atomical_id: atomical_id.clone(),
+            metadata: None,
+            location: OutPoint::new(atomical_id.txid, 0),
+            spent: false,
+            height: 0,
+            timestamp: 0,
+        };
+        state.outputs.insert(atomical_id.clone(), output);
+
+        // 测试存在的 Atomical
+        assert!(state.exists(&atomical_id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_seal_operations() -> Result<()> {
+        let state = AtomicalsState::new()?;
+        let atomical_id = create_test_atomical_id();
+
+        // 测试未封印状态
+        assert!(!state.is_sealed(&atomical_id)?);
+
+        // 封印 Atomical
+        state.sealed.insert(atomical_id.clone(), true);
+
+        // 测试已封印状态
+        assert!(state.is_sealed(&atomical_id)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_output_management() -> Result<()> {
+        let state = AtomicalsState::new()?;
+        let atomical_id = create_test_atomical_id();
+
+        // 测试获取不存在的输出
+        assert!(state.get_output(&atomical_id)?.is_none());
+
+        // 添加输出
+        let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: vec![1, 2, 3],
+                value: 1000,
+            },
+            atomical_id: atomical_id.clone(),
             metadata: Some(serde_json::json!({
                 "name": "Test NFT",
+                "description": "Test Description"
             })),
             location: OutPoint::new(atomical_id.txid, 0),
             spent: false,
             height: 100,
-            timestamp: 1644900000,
+            timestamp: 1234567890,
         };
+        state.outputs.insert(atomical_id.clone(), output.clone());
 
-        // 添加输出
+        // 测试获取存在的输出
+        let retrieved_output = state.get_output(&atomical_id)?.unwrap();
+        assert_eq!(retrieved_output.owner.value, 1000);
+        assert_eq!(retrieved_output.owner.script_pubkey, vec![1, 2, 3]);
+        assert_eq!(retrieved_output.height, 100);
+        assert_eq!(retrieved_output.timestamp, 1234567890);
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_management() -> Result<()> {
+        let state = AtomicalsState::new()?;
+        let atomical_id = create_test_atomical_id();
+
+        // 测试获取不存在的元数据
+        assert!(state.get_metadata(&atomical_id)?.is_none());
+
+        // 添加带元数据的输出
+        let metadata = serde_json::json!({
+            "name": "Test NFT",
+            "description": "Test Description",
+            "attributes": {
+                "rarity": "rare",
+                "level": 10
+            }
+        });
+        let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: vec![],
+                value: 1000,
+            },
+            atomical_id: atomical_id.clone(),
+            metadata: Some(metadata.clone()),
+            location: OutPoint::new(atomical_id.txid, 0),
+            spent: false,
+            height: 0,
+            timestamp: 0,
+        };
         state.outputs.insert(atomical_id.clone(), output);
 
-        // 测试存在性和封印状态
-        assert!(state.exists(&atomical_id)?);
-        assert!(!state.is_sealed(&atomical_id)?);
+        // 测试获取存在的元数据
+        let retrieved_metadata = state.get_metadata(&atomical_id)?.unwrap();
+        assert_eq!(retrieved_metadata, metadata);
+        Ok(())
+    }
 
-        // 测试获取输出和元数据
-        let retrieved = state.get_output(&atomical_id)?.unwrap();
-        assert_eq!(retrieved.owner.value, 1000);
+    #[test]
+    fn test_operation_application() -> Result<()> {
+        let mut state = AtomicalsState::new()?;
+        let tx = create_test_transaction();
+        let height = 100;
+        let timestamp = 1234567890;
 
-        let metadata = state.get_metadata(&atomical_id)?.unwrap();
-        assert_eq!(metadata["name"], "Test NFT");
+        // 测试铸造操作
+        let mint_metadata = serde_json::json!({
+            "name": "Test NFT",
+            "description": "Test Description"
+        });
+        let mint_op = AtomicalOperation::Mint {
+            atomical_type: AtomicalType::NFT,
+            metadata: mint_metadata.clone(),
+        };
+        state.apply_operations(vec![mint_op], &tx, height, timestamp)?;
 
-        // 测试封印
-        state.sealed.insert(atomical_id.clone(), true);
+        // 验证铸造结果
+        let atomical_id = AtomicalId {
+            txid: tx.txid(),
+            vout: 0,
+        };
+        let output = state.get_output(&atomical_id)?.unwrap();
+        assert_eq!(output.metadata.unwrap(), mint_metadata);
+        assert_eq!(output.height, height);
+        assert_eq!(output.timestamp, timestamp);
+
+        // 测试更新操作
+        let update_metadata = serde_json::json!({
+            "name": "Updated NFT",
+            "description": "Updated Description"
+        });
+        let update_op = AtomicalOperation::Update {
+            atomical_id: atomical_id.clone(),
+            metadata: update_metadata.clone(),
+        };
+        state.apply_operations(vec![update_op], &tx, height + 1, timestamp + 3600)?;
+
+        // 验证更新结果
+        let updated_output = state.get_output(&atomical_id)?.unwrap();
+        assert_eq!(updated_output.metadata.unwrap(), update_metadata);
+
+        // 测试封印操作
+        let seal_op = AtomicalOperation::Seal {
+            atomical_id: atomical_id.clone(),
+        };
+        state.apply_operations(vec![seal_op], &tx, height + 2, timestamp + 7200)?;
+
+        // 验证封印结果
         assert!(state.is_sealed(&atomical_id)?);
+
+        // 测试转移操作
+        let transfer_op = AtomicalOperation::Transfer {
+            atomical_id: atomical_id.clone(),
+            output_index: 0,
+        };
+        state.apply_operations(vec![transfer_op], &tx, height + 3, timestamp + 10800)?;
+
+        // 验证转移结果
+        let transferred_output = state.get_output(&atomical_id)?.unwrap();
+        assert_eq!(transferred_output.height, height + 3);
+        assert_eq!(transferred_output.timestamp, timestamp + 10800);
+        Ok(())
+    }
+
+    #[test]
+    fn test_websocket_notifications() -> Result<()> {
+        let mut state = AtomicalsState::new()?;
+        let atomical_id = create_test_atomical_id();
+        let tx = create_test_transaction();
+
+        // 创建一个接收通道
+        let mut rx = state.broadcast_tx.subscribe();
+
+        // 测试所有权变更通知
+        let output = TxOut {
+            value: Amount::from_sat(2000).to_sat(),
+            script_pubkey: Builder::new().into_script(),
+        };
+        state.notify_ownership_change(&atomical_id, &output)?;
+
+        // 验证通知
+        if let Ok(WsMessage::AtomicalUpdate(update)) = rx.try_recv() {
+            assert_eq!(update.id, atomical_id);
+            assert_eq!(update.update_type, UpdateType::OwnershipChange);
+        }
+
+        // 测试状态更新通知
+        state.notify_state_update(&atomical_id)?;
+
+        // 验证通知
+        if let Ok(WsMessage::AtomicalUpdate(update)) = rx.try_recv() {
+            assert_eq!(update.id, atomical_id);
+            assert_eq!(update.update_type, UpdateType::StateUpdate);
+        }
+
+        // 测试封印状态变更通知
+        state.notify_seal_status_change(&atomical_id, true)?;
+
+        // 验证通知
+        if let Ok(WsMessage::AtomicalUpdate(update)) = rx.try_recv() {
+            assert_eq!(update.id, atomical_id);
+            assert_eq!(update.update_type, UpdateType::SealStatusChange);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_operations() -> Result<()> {
+        let state = Arc::new(AtomicalsState::new()?);
+        let atomical_id = create_test_atomical_id();
+        let tx = create_test_transaction();
+
+        // 创建多个并发任务
+        let mut handles = vec![];
+        for i in 0..10 {
+            let state = state.clone();
+            let atomical_id = atomical_id.clone();
+            let tx = tx.clone();
+            
+            let handle = tokio::spawn(async move {
+                // 执行并发操作
+                let metadata = serde_json::json!({
+                    "name": format!("Test NFT {}", i),
+                    "description": format!("Test Description {}", i)
+                });
+                
+                let mint_op = AtomicalOperation::Mint {
+                    atomical_type: AtomicalType::NFT,
+                    metadata: metadata.clone(),
+                };
+                
+                state.apply_operations(vec![mint_op], &tx, 100 + i, 1234567890 + i).unwrap();
+            });
+            
+            handles.push(handle);
+        }
+
+        // 等待所有任务完成
+        for handle in handles {
+            handle.await.unwrap();
+        }
 
         Ok(())
     }

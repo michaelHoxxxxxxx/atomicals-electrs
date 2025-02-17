@@ -373,3 +373,248 @@ pub struct WebSocketMetricsSnapshot {
     pub latency: LatencyMetrics,
     pub ip_stats: HashMap<String, IpStats>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn test_connection_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试连接记录
+        rt.block_on(async {
+            metrics.record_connection("127.0.0.1").await;
+            metrics.record_connection("192.168.1.1").await;
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.connection.current_connections, 2);
+            assert_eq!(snapshot.connection.max_connections, 2);
+            assert_eq!(snapshot.connection.total_connections, 2);
+        });
+
+        // 测试断开连接
+        rt.block_on(async {
+            metrics.record_disconnection();
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.connection.current_connections, 1);
+            assert_eq!(snapshot.connection.max_connections, 2);
+            assert_eq!(snapshot.connection.total_connections, 2);
+        });
+
+        // 测试认证
+        rt.block_on(async {
+            metrics.record_auth_success();
+            metrics.record_auth_failure("127.0.0.1").await;
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.connection.auth_success, 1);
+            assert_eq!(snapshot.connection.auth_failures, 1);
+        });
+    }
+
+    #[test]
+    fn test_message_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试消息记录
+        rt.block_on(async {
+            metrics.record_message_sent(100);
+            metrics.record_message_received(200);
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.message.messages_sent, 1);
+            assert_eq!(snapshot.message.messages_received, 1);
+            assert_eq!(snapshot.message.bytes_original, 300);
+        });
+
+        // 测试压缩记录
+        rt.block_on(async {
+            metrics.record_compression(1000, 500);
+            metrics.record_decompression(500, 1000);
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.message.messages_compressed, 1);
+            assert_eq!(snapshot.message.messages_decompressed, 1);
+            assert_eq!(snapshot.message.bytes_compressed, 500);
+        });
+    }
+
+    #[test]
+    fn test_subscription_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试订阅记录
+        rt.block_on(async {
+            metrics.record_subscription();
+            metrics.record_subscription();
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.subscription.current_subscriptions, 2);
+            assert_eq!(snapshot.subscription.max_subscriptions, 2);
+            assert_eq!(snapshot.subscription.total_subscriptions, 2);
+        });
+
+        // 测试取消订阅
+        rt.block_on(async {
+            metrics.record_unsubscription();
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.subscription.current_subscriptions, 1);
+            assert_eq!(snapshot.subscription.max_subscriptions, 2);
+            assert_eq!(snapshot.subscription.total_subscriptions, 2);
+        });
+    }
+
+    #[test]
+    fn test_error_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试错误记录
+        rt.block_on(async {
+            metrics.record_error(ErrorType::Connection);
+            metrics.record_error(ErrorType::Message);
+            metrics.record_error(ErrorType::Authentication);
+            metrics.record_error(ErrorType::Compression);
+            
+            let snapshot = metrics.get_metrics().await;
+            assert_eq!(snapshot.error.connection_errors, 1);
+            assert_eq!(snapshot.error.message_errors, 1);
+            assert_eq!(snapshot.error.auth_errors, 1);
+            assert_eq!(snapshot.error.compression_errors, 1);
+        });
+    }
+
+    #[test]
+    fn test_latency_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试延迟记录
+        rt.block_on(async {
+            metrics.record_latency(LatencyType::MessageProcessing, Duration::from_millis(100));
+            metrics.record_latency(LatencyType::Compression, Duration::from_millis(50));
+            metrics.record_latency(LatencyType::Authentication, Duration::from_millis(75));
+            
+            let snapshot = metrics.get_metrics().await;
+            assert!(!snapshot.latency.message_processing.is_empty());
+            assert!(!snapshot.latency.compression.is_empty());
+            assert!(!snapshot.latency.authentication.is_empty());
+
+            // 验证延迟值
+            assert_eq!(snapshot.latency.message_processing[0], 100);
+            assert_eq!(snapshot.latency.compression[0], 50);
+            assert_eq!(snapshot.latency.authentication[0], 75);
+        });
+    }
+
+    #[test]
+    fn test_ip_stats() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试 IP 统计
+        rt.block_on(async {
+            // 记录连接和认证失败
+            metrics.record_connection("127.0.0.1").await;
+            metrics.record_auth_failure("127.0.0.1").await;
+            metrics.record_connection("127.0.0.1").await;
+            
+            let snapshot = metrics.get_metrics().await;
+            let ip_stats = snapshot.ip_stats.get("127.0.0.1").unwrap();
+            
+            assert_eq!(ip_stats.connection_count, 2);
+            assert_eq!(ip_stats.auth_failures, 1);
+            assert!(ip_stats.last_connection > 0);
+        });
+    }
+
+    #[test]
+    fn test_metrics_snapshot() {
+        let rt = Runtime::new().unwrap();
+        let metrics = WebSocketMetrics::new();
+
+        // 测试指标快照
+        rt.block_on(async {
+            // 添加各种指标数据
+            metrics.record_connection("127.0.0.1").await;
+            metrics.record_auth_success();
+            metrics.record_message_sent(100);
+            metrics.record_subscription();
+            metrics.record_error(ErrorType::Connection);
+            metrics.record_latency(LatencyType::MessageProcessing, Duration::from_millis(100));
+
+            // 获取快照并验证
+            let snapshot = metrics.get_metrics().await;
+            
+            // 验证连接指标
+            assert_eq!(snapshot.connection.current_connections, 1);
+            assert_eq!(snapshot.connection.auth_success, 1);
+
+            // 验证消息指标
+            assert_eq!(snapshot.message.messages_sent, 1);
+            assert_eq!(snapshot.message.bytes_original, 100);
+
+            // 验证订阅指标
+            assert_eq!(snapshot.subscription.current_subscriptions, 1);
+
+            // 验证错误指标
+            assert_eq!(snapshot.error.connection_errors, 1);
+
+            // 验证延迟指标
+            assert!(!snapshot.latency.message_processing.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_concurrent_metrics() {
+        let rt = Runtime::new().unwrap();
+        let metrics = Arc::new(WebSocketMetrics::new());
+
+        rt.block_on(async {
+            let mut handles = vec![];
+            
+            // 创建多个任务并发更新指标
+            for i in 0..10 {
+                let metrics = metrics.clone();
+                let handle = tokio::spawn(async move {
+                    // 记录连接
+                    metrics.record_connection(&format!("127.0.0.{}", i)).await;
+                    metrics.record_message_sent(100);
+                    metrics.record_subscription();
+                    metrics.record_latency(LatencyType::MessageProcessing, Duration::from_millis(100));
+                    
+                    // 模拟一些操作后断开连接
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    metrics.record_disconnection();
+                });
+                handles.push(handle);
+            }
+
+            // 等待所有任务完成
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            // 验证最终状态
+            let snapshot = metrics.get_metrics().await;
+            
+            // 所有连接都已断开
+            assert_eq!(snapshot.connection.current_connections, 0);
+            // 总共有 10 个连接
+            assert_eq!(snapshot.connection.total_connections, 10);
+            // 最大同时连接数应该是 10
+            assert_eq!(snapshot.connection.max_connections, 10);
+            // 验证消息和订阅数
+            assert_eq!(snapshot.message.messages_sent, 10);
+            assert_eq!(snapshot.subscription.total_subscriptions, 10);
+        });
+    }
+}

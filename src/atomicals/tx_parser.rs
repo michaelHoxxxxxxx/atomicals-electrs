@@ -175,4 +175,232 @@ mod tests {
             _ => panic!("Expected Update operation"),
         }
     }
+
+    #[test]
+    fn test_parse_seal() {
+        let mut tx = create_test_transaction();
+        
+        // 创建封印操作的输出
+        let atomical_id = create_test_atomical_id();
+        
+        let mut script_data = ATOMICALS_PREFIX.to_vec();
+        script_data.extend_from_slice(b"seal");
+        script_data.extend_from_slice(&atomical_id.txid.to_vec());
+        script_data.extend_from_slice(&atomical_id.vout.to_be_bytes());
+        
+        let script = Builder::new()
+            .push_slice(&script_data)
+            .into_script();
+            
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 解析交易
+        let operations = parse_transaction(&tx).unwrap();
+        assert_eq!(operations.len(), 1);
+        
+        match &operations[0] {
+            AtomicalOperation::Seal { atomical_id: parsed_id } => {
+                assert_eq!(*parsed_id, atomical_id);
+            }
+            _ => panic!("Expected Seal operation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_transfer() {
+        let mut tx = create_test_transaction();
+        
+        // 创建转移操作的输出
+        let atomical_id = create_test_atomical_id();
+        let output_index = 1u32;
+        
+        let mut script_data = ATOMICALS_PREFIX.to_vec();
+        script_data.extend_from_slice(b"transfer");
+        script_data.extend_from_slice(&atomical_id.txid.to_vec());
+        script_data.extend_from_slice(&atomical_id.vout.to_be_bytes());
+        script_data.extend_from_slice(&output_index.to_be_bytes());
+        
+        let script = Builder::new()
+            .push_slice(&script_data)
+            .into_script();
+            
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 解析交易
+        let operations = parse_transaction(&tx).unwrap();
+        assert_eq!(operations.len(), 1);
+        
+        match &operations[0] {
+            AtomicalOperation::Transfer { atomical_id: parsed_id, output_index: parsed_index } => {
+                assert_eq!(*parsed_id, atomical_id);
+                assert_eq!(*parsed_index, output_index);
+            }
+            _ => panic!("Expected Transfer operation"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_operations() {
+        let mut tx = create_test_transaction();
+        
+        // 1. 测试无效的前缀
+        let mut invalid_prefix = b"invalid".to_vec();
+        invalid_prefix.extend_from_slice(b"mint");
+        let script = Builder::new()
+            .push_slice(&invalid_prefix)
+            .into_script();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 2. 测试无效的操作类型
+        let mut invalid_op = ATOMICALS_PREFIX.to_vec();
+        invalid_op.extend_from_slice(b"invalid_op");
+        let script = Builder::new()
+            .push_slice(&invalid_op)
+            .into_script();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 3. 测试损坏的数据
+        let mut corrupted_data = ATOMICALS_PREFIX.to_vec();
+        corrupted_data.extend_from_slice(b"mint");
+        corrupted_data.extend_from_slice(b"corrupted");
+        let script = Builder::new()
+            .push_slice(&corrupted_data)
+            .into_script();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 所有操作都应该被忽略
+        let operations = parse_transaction(&tx).unwrap();
+        assert_eq!(operations.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_operations() {
+        let mut tx = create_test_transaction();
+        let atomical_id = create_test_atomical_id();
+        
+        // 1. 添加铸造操作
+        let metadata = serde_json::json!({ "name": "Test NFT" });
+        let mut mint_data = ATOMICALS_PREFIX.to_vec();
+        mint_data.extend_from_slice(b"mint");
+        mint_data.extend_from_slice(&serde_json::to_vec(&metadata).unwrap());
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: Builder::new().push_slice(&mint_data).into_script(),
+        });
+
+        // 2. 添加转移操作
+        let mut transfer_data = ATOMICALS_PREFIX.to_vec();
+        transfer_data.extend_from_slice(b"transfer");
+        transfer_data.extend_from_slice(&atomical_id.txid.to_vec());
+        transfer_data.extend_from_slice(&atomical_id.vout.to_be_bytes());
+        transfer_data.extend_from_slice(&2u32.to_be_bytes());
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: Builder::new().push_slice(&transfer_data).into_script(),
+        });
+
+        // 3. 添加更新操作
+        let update_metadata = serde_json::json!({ "updated": true });
+        let mut update_data = ATOMICALS_PREFIX.to_vec();
+        update_data.extend_from_slice(b"update");
+        update_data.extend_from_slice(&atomical_id.txid.to_vec());
+        update_data.extend_from_slice(&atomical_id.vout.to_be_bytes());
+        update_data.extend_from_slice(&serde_json::to_vec(&update_metadata).unwrap());
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: Builder::new().push_slice(&update_data).into_script(),
+        });
+
+        // 验证所有操作都被正确解析
+        let operations = parse_transaction(&tx).unwrap();
+        assert_eq!(operations.len(), 3);
+
+        // 验证每个操作的类型
+        assert!(matches!(operations[0], AtomicalOperation::Mint { .. }));
+        assert!(matches!(operations[1], AtomicalOperation::Transfer { .. }));
+        assert!(matches!(operations[2], AtomicalOperation::Update { .. }));
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let mut tx = create_test_transaction();
+        
+        // 1. 测试空脚本
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: Builder::new().into_script(),
+        });
+
+        // 2. 测试只有前缀的脚本
+        let script = Builder::new()
+            .push_slice(ATOMICALS_PREFIX)
+            .into_script();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 3. 测试超大元数据
+        let mut large_metadata = serde_json::Map::new();
+        for i in 0..1000 {
+            large_metadata.insert(format!("key_{}", i), serde_json::Value::String("value".to_string()));
+        }
+        let mut large_data = ATOMICALS_PREFIX.to_vec();
+        large_data.extend_from_slice(b"mint");
+        large_data.extend_from_slice(&serde_json::to_vec(&large_metadata).unwrap());
+        let script = Builder::new()
+            .push_slice(&large_data)
+            .into_script();
+        tx.output.push(TxOut {
+            value: Amount::from_sat(1000).to_sat(),
+            script_pubkey: script,
+        });
+
+        // 4. 测试零值输出
+        let atomical_id = create_test_atomical_id();
+        let mut transfer_data = ATOMICALS_PREFIX.to_vec();
+        transfer_data.extend_from_slice(b"transfer");
+        transfer_data.extend_from_slice(&atomical_id.txid.to_vec());
+        transfer_data.extend_from_slice(&atomical_id.vout.to_be_bytes());
+        transfer_data.extend_from_slice(&0u32.to_be_bytes());
+        tx.output.push(TxOut {
+            value: Amount::from_sat(0).to_sat(),
+            script_pubkey: Builder::new().push_slice(&transfer_data).into_script(),
+        });
+
+        // 验证处理
+        let operations = parse_transaction(&tx).unwrap();
+        
+        // 空脚本和只有前缀的脚本应该被忽略
+        // 超大元数据应该能正常解析
+        // 零值输出的操作应该能正常解析
+        assert!(operations.len() >= 2);
+
+        // 验证超大元数据的解析
+        let has_large_metadata = operations.iter().any(|op| {
+            matches!(op, AtomicalOperation::Mint { metadata: Some(m), .. } if m.as_object().unwrap().len() == 1000)
+        });
+        assert!(has_large_metadata);
+
+        // 验证零值输出的操作
+        let has_zero_value_transfer = operations.iter().any(|op| {
+            matches!(op, AtomicalOperation::Transfer { atomical_id: id, output_index } if *id == atomical_id && *output_index == 0)
+        });
+        assert!(has_zero_value_transfer);
+    }
 }
