@@ -1,6 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
+
+use electrs_rocksdb::{DB, ColumnFamilyDescriptor, Options};
 use anyhow::{anyhow, Result};
-use rocksdb::{DB, ColumnFamilyDescriptor, Options};
 use serde::{Serialize, Deserialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 

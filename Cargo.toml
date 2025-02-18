@@ -43,23 +43,22 @@ num_cpus = "1.13"
 parking_lot = "0.12"
 prometheus = { version = "0.13", optional = true }
 rayon = "1.9"
-rocksdb = "0.21"
 serde = { version = "1.0", features = ["derive"] }
-serde_derive = "1.0, <=1.0.171"  # avoid precompiled binaries (https://github.com/serde-rs/serde/issues/2538)
+serde_derive = "1.0.184"
 serde_json = "1.0"
 signal-hook = "0.3"
 stderrlog = "0.5"
 tempfile = "3.16"
 threadpool = "1.8"
 thiserror = "1.0"
-time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+time = { version = "0.3.35", features = ["formatting", "macros", "parsing"] }
 tiny_http = { version = "0.12", optional = true }
 url = "2.2"
-# WebSocket 相关依赖
 warp = "0.3"
 tokio-tungstenite = "0.20"
 futures = "0.3"
 uuid = { version = "1.4", features = ["v4"] }
+tokio = { version = "1.25", features = ["full"] }
 
 [target.'cfg(windows)'.dependencies]
 ctrlc = "=3.4.2"
@@ -78,8 +77,22 @@ configure_me_codegen = { version = "0.4.8", default-features = false }
 [dev-dependencies]
 bitcoin-test-data = "0.2.0"
 hex_lit = "0.1.1"
+criterion = { version = "0.4", features = ["html_reports", "async_tokio"] }
+tempfile = "3.3"
 pretty_assertions = "1.4"
-tempfile = "3.16"
+
+[[bench]]
+name = "atomicals"
+path = "tests/bench/mod.rs"
+harness = false
 
 [profile.release]
 lto = true
+codegen-units = 1
+panic = 'abort'
+debug = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = true

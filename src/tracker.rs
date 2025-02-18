@@ -1,10 +1,12 @@
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bitcoin::{BlockHash, Txid};
 use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
 
 use crate::{
+    atomicals::AtomicalsManager,
     cache::Cache,
     chain::Chain,
     config::Config,
@@ -22,8 +24,9 @@ use crate::{
 pub struct Tracker {
     index: Index,
     mempool: Mempool,
-    metrics: Metrics,
+    metrics: Arc<Metrics>,
     ignore_mempool: bool,
+    atomicals: Arc<AtomicalsManager>,
 }
 
 pub(crate) enum Error {
@@ -31,27 +34,32 @@ pub(crate) enum Error {
 }
 
 impl Tracker {
-    pub fn new(config: &Config, metrics: Metrics) -> Result<Self> {
+    pub fn new(
+        config: &Config,
+        metrics: Arc<Metrics>,
+        atomicals: Arc<AtomicalsManager>,
+    ) -> Result<Self> {
         let store = DBStore::open(
             &config.db_path,
             config.db_log_dir.as_deref(),
             config.auto_reindex,
             config.db_parallelism,
         )?;
-        let chain = Chain::new(config.network);
+        let chain = Chain::new(config.network, Arc::clone(&atomicals));
         Ok(Self {
             index: Index::load(
                 store,
                 chain,
-                &metrics,
+                metrics.clone(),
                 config.index_batch_size,
                 config.index_lookup_limit,
                 config.reindex_last_blocks,
             )
             .context("failed to open index")?,
-            mempool: Mempool::new(&metrics),
+            mempool: Mempool::new(metrics.clone(), Arc::clone(&atomicals)),
             metrics,
             ignore_mempool: config.ignore_mempool,
+            atomicals,
         })
     }
 

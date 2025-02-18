@@ -188,7 +188,7 @@ impl Mempool {
         let added = update.new_entries.len();
 
         for txid_to_remove in update.removed_entries {
-            self.remove_entry(txid_to_remove);
+            self.remove_entry(txid_to_remove)?;
         }
 
         for entry in update.new_entries {
@@ -269,21 +269,23 @@ impl Mempool {
     }
 
     /// Remove a transaction entry from the mempool and update the fee histogram.
-    fn remove_entry(&mut self, txid: Txid) {
-        let entry = self.entries.remove(&txid).expect("missing tx from mempool");
-        for txi in entry.tx.input {
-            self.by_spending.remove(&(txi.previous_output, txid));
-        }
-        for txo in entry.tx.output {
-            let scripthash = ScriptHash::new(&txo.script_pubkey);
-            self.by_funding.remove(&(scripthash, txid)); // may have misses
-        }
+    fn remove_entry(&mut self, txid: Txid) -> Result<()> {
+        if let Some(entry) = self.entries.remove(&txid) {
+            for txi in entry.tx.input {
+                self.by_spending.remove(&(txi.previous_output, txid));
+            }
+            for txo in entry.tx.output {
+                let scripthash = ScriptHash::new(&txo.script_pubkey);
+                self.by_funding.remove(&(scripthash, txid)); // may have misses
+            }
 
-        self.modify_fee_histogram(entry.fee, -(entry.vsize as i64));
+            self.modify_fee_histogram(entry.fee, -(entry.vsize as i64));
 
-        if let Some(operations) = self.pending_operations.write().remove(&txid) {
-            self.rollback_pending_operations(&txid, &operations)?;
+            if let Some(operations) = self.pending_operations.write().remove(&txid) {
+                self.rollback_pending_operations(&txid, &operations)?;
+            }
         }
+        Ok(())
     }
 
     /// Apply a change to the fee histogram. Used when transactions are added or

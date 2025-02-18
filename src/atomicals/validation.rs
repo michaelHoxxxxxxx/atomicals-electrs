@@ -107,7 +107,7 @@ fn validate_mint(atomical_type: &AtomicalType, metadata: &Value) -> Result<()> {
 }
 
 /// 验证更新操作
-fn validate_update(state: &AtomicalsState, tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
+fn validate_update(state: &AtomicalsState, _tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
     // 检查 Atomical 是否存在
     if !state.exists(atomical_id)? {
         return Err(anyhow!("Atomical does not exist"));
@@ -122,7 +122,7 @@ fn validate_update(state: &AtomicalsState, tx: &Transaction, atomical_id: &Atomi
 }
 
 /// 验证封印操作
-fn validate_seal(state: &AtomicalsState, tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
+fn validate_seal(state: &AtomicalsState, _tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
     // 检查 Atomical 是否存在
     if !state.exists(atomical_id)? {
         return Err(anyhow!("Atomical does not exist"));
