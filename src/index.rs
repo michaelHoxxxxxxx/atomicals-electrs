@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Stats {
     update_duration: Histogram,
     update_size: Histogram,
@@ -81,6 +81,7 @@ impl Stats {
 }
 
 /// Confirmed transactions' address index
+#[derive(Default)]
 pub struct Index {
     store: DBStore,
     batch_size: usize,

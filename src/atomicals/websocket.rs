@@ -1,21 +1,26 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
-use warp::ws::{WebSocket, Ws};
 use warp::Filter;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use crate::atomicals::metrics::{WebSocketMetrics, ErrorType, LatencyType};
+use warp::ws::{WebSocket, Ws};
+
+use crate::atomicals::{AtomicalId, AtomicalOperation};
+use crate::atomicals::rpc::AtomicalInfo;
+use crate::atomicals::metrics::{WebSocketMetrics, LatencyType, ErrorType};
+use crate::atomicals::AtomicalsState;
+use crate::config::Config as AppConfig;
 
 /// 认证令牌声明
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,10 +80,8 @@ pub enum WsMessage {
 /// 订阅请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeRequest {
-    /// 订阅类型
+    pub id: AtomicalId,
     pub subscription_type: SubscriptionType,
-    /// 订阅参数
-    pub params: Value,
 }
 
 /// 取消订阅请求
@@ -93,10 +96,8 @@ pub struct UnsubscribeRequest {
 pub enum SubscriptionType {
     /// 订阅特定 Atomical
     Atomical(AtomicalId),
-    /// 订阅地址
-    Address(String),
     /// 订阅所有新操作
-    AllOperations,
+    All,
 }
 
 /// Atomical 更新通知
@@ -292,7 +293,9 @@ pub struct WsServer {
     /// 连接数
     connection_count: std::sync::atomic::AtomicUsize,
     /// 配置
-    config: Config,
+    config: AppConfig,
+    /// WebSocket 配置
+    websocket_config: WebSocketConfig,
     /// 连接池
     connections: Arc<RwLock<HashMap<String, Connection>>>,
     /// 关闭标志
@@ -307,11 +310,11 @@ pub struct WsServer {
 
 impl WsServer {
     /// 创建新的 WebSocket 服务器
-    pub fn new(state: Arc<AtomicalsState>, config: Config) -> Self {
+    pub fn new(state: Arc<AtomicalsState>, config: AppConfig) -> Self {
         let (broadcast_tx, _) = broadcast::channel(1024);
         let message_handler = MessageHandler::new(
-            config.compression_level.unwrap_or(CompressionLevel::Default),
-            config.compression_threshold.unwrap_or(1024),
+            config.websocket_config.compression_level.unwrap_or(CompressionLevel::Default),
+            config.websocket_config.compression_threshold.unwrap_or(1024),
         );
 
         Self {
@@ -320,9 +323,10 @@ impl WsServer {
             last_pong: std::sync::atomic::AtomicU64::new(0),
             connection_count: std::sync::atomic::AtomicUsize::new(0),
             config,
+            websocket_config: config.websocket_config,
             connections: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            jwt_key: config.jwt_key.unwrap_or_else(|| "default_key".to_string()),
+            jwt_key: config.websocket_config.jwt_secret,
             message_handler,
             metrics: Arc::new(WebSocketMetrics::new()),
         }
@@ -359,7 +363,7 @@ impl WsServer {
 
         // 检查是否达到最大连接数
         let current_connections = self.connection_count.load(std::sync::atomic::Ordering::Relaxed);
-        if current_connections >= self.config.websocket_max_connections.unwrap_or(1000) {
+        if current_connections >= self.websocket_config.max_connections {
             let _ = ws.close().await;
             return;
         }
@@ -564,8 +568,8 @@ impl WsServer {
             interval.tick().await;
 
             let mut connections = self.connections.write().await;
-            let timeout = Duration::from_secs(self.config.websocket_connection_timeout.unwrap_or(300));
-            
+            let timeout = Duration::from_secs(self.websocket_config.connection_timeout);
+
             // 找出超时的连接
             let expired_connections: Vec<String> = connections
                 .iter()
@@ -609,13 +613,7 @@ impl WsServer {
                     return Err(anyhow!("Atomical not found"));
                 }
             }
-            SubscriptionType::Address(ref address) => {
-                // 验证地址格式
-                if bitcoin::Address::from_str(address).is_err() {
-                    return Err(anyhow!("Invalid address"));
-                }
-            }
-            SubscriptionType::AllOperations => {
+            SubscriptionType::All => {
                 // 不需要特殊验证
             }
         }
@@ -657,30 +655,30 @@ impl WsServer {
     }
 }
 
-/// 配置结构体
+/// WebSocket 配置结构体
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct WebSocketConfig {
     /// WebSocket 心跳间隔（秒）
-    pub websocket_heartbeat_interval: Option<u64>,
+    pub heartbeat_interval: Option<u64>,
     /// WebSocket 最大连接数
-    pub websocket_max_connections: Option<usize>,
+    pub max_connections: Option<usize>,
     /// WebSocket 连接超时时间（秒）
-    pub websocket_connection_timeout: Option<u64>,
+    pub connection_timeout: Option<u64>,
     /// JWT 密钥
-    pub jwt_key: Option<String>,
+    pub jwt_secret: Option<String>,
     /// 压缩级别
     pub compression_level: Option<CompressionLevel>,
     /// 压缩阈值（字节）
     pub compression_threshold: Option<usize>,
 }
 
-impl Default for Config {
+impl Default for WebSocketConfig {
     fn default() -> Self {
         Self {
-            websocket_heartbeat_interval: Some(30),
-            websocket_max_connections: Some(1000),
-            websocket_connection_timeout: Some(300),
-            jwt_key: None,
+            heartbeat_interval: Some(30),
+            max_connections: Some(1000),
+            connection_timeout: Some(300),
+            jwt_secret: None,
             compression_level: Some(CompressionLevel::Default),
             compression_threshold: Some(1024),
         }
@@ -697,16 +695,18 @@ mod tests {
     use tokio::time::{sleep, Duration};
     use warp::test::WsClient;
 
-    fn create_test_config() -> Config {
-        Config {
-            jwt_secret: "test_secret".to_string(),
-            max_connections: 100,
-            max_subscriptions_per_connection: 10,
-            connection_timeout: Duration::from_secs(60),
-            compression_level: CompressionLevel::Fast,
-            compression_threshold: 1024,
-            heartbeat_interval: Duration::from_secs(30),
-            cleanup_interval: Duration::from_secs(60),
+    fn create_test_config() -> AppConfig {
+        AppConfig {
+            websocket_config: WebSocketConfig {
+                jwt_secret: Some("test_secret".to_string()),
+                max_connections: Some(100),
+                max_subscriptions_per_connection: Some(10),
+                connection_timeout: Some(Duration::from_secs(60).as_secs() as u64),
+                compression_level: Some(CompressionLevel::Fast),
+                compression_threshold: Some(1024),
+                heartbeat_interval: Some(Duration::from_secs(30).as_secs() as u64),
+                cleanup_interval: Some(Duration::from_secs(60).as_secs() as u64),
+            },
         }
     }
 
@@ -826,13 +826,11 @@ mod tests {
 
     #[test]
     fn test_config() {
-        let config = Config::default();
+        let config = WebSocketConfig::default();
         assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.max_subscriptions_per_connection, 100);
-        assert_eq!(config.connection_timeout, Duration::from_secs(300));
+        assert_eq!(config.connection_timeout, 300);
         assert_eq!(config.compression_threshold, 1024);
-        assert_eq!(config.heartbeat_interval, Duration::from_secs(30));
-        assert_eq!(config.cleanup_interval, Duration::from_secs(60));
+        assert_eq!(config.heartbeat_interval, 30);
     }
 
     #[test]
@@ -846,7 +844,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+            &EncodingKey::from_secret(config.websocket_config.jwt_secret.as_ref().unwrap().as_bytes()),
         )?;
 
         // 测试有效令牌
@@ -863,7 +861,7 @@ mod tests {
         let expired_token = jsonwebtoken::encode(
             &Header::default(),
             &expired_claims,
-            &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+            &EncodingKey::from_secret(config.websocket_config.jwt_secret.as_ref().unwrap().as_bytes()),
         )?;
         assert!(server.verify_token(&expired_token).is_err());
 
@@ -894,25 +892,40 @@ mod tests {
 
         // 测试订阅请求
         let req = SubscribeRequest {
-            subscription_type: SubscriptionType::AllOperations,
-            params: serde_json::json!({}),
+            id: AtomicalId {
+                txid: bitcoin::Txid::from_str(
+                    "1234567890123456789012345678901234567890123456789012345678901234"
+                ).unwrap(),
+                vout: 0,
+            },
+            subscription_type: SubscriptionType::All,
         };
 
         let sub_id = server.handle_subscribe(&req)?;
         assert!(!sub_id.is_empty());
 
         // 测试超出最大订阅数
-        for _ in 0..config.max_subscriptions_per_connection {
+        for _ in 0..config.websocket_config.max_connections.unwrap_or(1000) {
             let req = SubscribeRequest {
-                subscription_type: SubscriptionType::AllOperations,
-                params: serde_json::json!({}),
+                id: AtomicalId {
+                    txid: bitcoin::Txid::from_str(
+                        "1234567890123456789012345678901234567890123456789012345678901234"
+                    ).unwrap(),
+                    vout: 0,
+                },
+                subscription_type: SubscriptionType::All,
             };
             server.handle_subscribe(&req)?;
         }
 
         let req = SubscribeRequest {
-            subscription_type: SubscriptionType::AllOperations,
-            params: serde_json::json!({}),
+            id: AtomicalId {
+                txid: bitcoin::Txid::from_str(
+                    "1234567890123456789012345678901234567890123456789012345678901234"
+                ).unwrap(),
+                vout: 0,
+            },
+            subscription_type: SubscriptionType::All,
         };
         assert!(server.handle_subscribe(&req).is_err());
 

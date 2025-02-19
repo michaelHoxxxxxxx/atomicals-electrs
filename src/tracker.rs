@@ -1,12 +1,14 @@
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bitcoin::{BlockHash, Txid};
 use bitcoin_slices::{bsl, Error::VisitBreak, Visit, Visitor};
+use tokio::time;
 
 use crate::{
-    atomicals::AtomicalsManager,
+    atomicals::AtomicalsState,
     cache::Cache,
     chain::Chain,
     config::Config,
@@ -26,7 +28,9 @@ pub struct Tracker {
     mempool: Mempool,
     metrics: Arc<Metrics>,
     ignore_mempool: bool,
-    atomicals: Arc<AtomicalsManager>,
+    atomicals: Arc<AtomicalsState>,
+    chain: Arc<Chain>,
+    daemon: Arc<Daemon>,
 }
 
 pub(crate) enum Error {
@@ -35,39 +39,28 @@ pub(crate) enum Error {
 
 impl Tracker {
     pub fn new(
-        config: &Config,
+        daemon: Arc<Daemon>,
+        chain: Arc<Chain>,
         metrics: Arc<Metrics>,
-        atomicals: Arc<AtomicalsManager>,
-    ) -> Result<Self> {
-        let store = DBStore::open(
-            &config.db_path,
-            config.db_log_dir.as_deref(),
-            config.auto_reindex,
-            config.db_parallelism,
-        )?;
-        let chain = Chain::new(config.network, Arc::clone(&atomicals));
-        Ok(Self {
-            index: Index::load(
-                store,
-                chain,
-                metrics.clone(),
-                config.index_batch_size,
-                config.index_lookup_limit,
-                config.reindex_last_blocks,
-            )
-            .context("failed to open index")?,
-            mempool: Mempool::new(metrics.clone(), Arc::clone(&atomicals)),
+        atomicals: Arc<AtomicalsState>,
+    ) -> Self {
+        let metrics_ref: &Metrics = &metrics;
+        Self {
+            daemon,
+            chain,
+            mempool: Mempool::new(metrics_ref, Arc::clone(&atomicals)),
             metrics,
-            ignore_mempool: config.ignore_mempool,
             atomicals,
-        })
+            index: Index::default(),
+            ignore_mempool: false,
+        }
     }
 
     pub(crate) fn chain(&self) -> &Chain {
-        self.index.chain()
+        &self.chain
     }
 
-    pub(crate) fn fees_histogram(&self) -> &FeeHistogram {
+    pub(crate) fn fees_histogram(&self) -> &[(f32, u32)] {
         self.mempool.fees_histogram()
     }
 
@@ -76,16 +69,31 @@ impl Tracker {
     }
 
     pub(crate) fn get_unspent(&self, status: &ScriptHashStatus) -> Vec<UnspentEntry> {
-        status.get_unspent(self.index.chain())
+        status.get_unspent(self.chain())
     }
 
-    pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
-        let done = self.index.sync(daemon, exit_flag)?;
-        if done && !self.ignore_mempool {
-            self.mempool.sync(daemon, exit_flag);
-            // TODO: double check tip - and retry on diff
+    pub(crate) async fn sync(&mut self, exit_flag: &ExitFlag) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        while !exit_flag.is_set() {
+            interval.tick().await;
+
+            // 同步 mempool
+            self.mempool.sync(&self.daemon, exit_flag)?;
+
+            // 更新统计信息
+            self.update_stats();
         }
-        Ok(done)
+
+        Ok(())
+    }
+
+    fn update_stats(&self) {
+        // 实现统计信息更新逻辑
+    }
+
+    pub fn handle_reorg(&mut self, old_tip: &BlockHash, new_tip: &BlockHash) -> Result<()> {
+        self.chain.handle_reorg(old_tip, new_tip)
     }
 
     pub(crate) fn status(&self) -> Result<(), Error> {
@@ -130,15 +138,23 @@ impl Tracker {
         })?;
         Ok(result)
     }
+
+    pub fn track_mempool(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<()> {
+        self.mempool.sync(daemon, exit_flag);
+        while !exit_flag.is_set() {
+            self.mempool.sync(daemon, exit_flag);
+        }
+        Ok(())
+    }
 }
 
 pub struct FindTransaction {
-    txid: bitcoin::Txid,
+    txid: Txid,
     found: Option<Box<[u8]>>, // no need to deserialize
 }
 
 impl FindTransaction {
-    pub fn new(txid: bitcoin::Txid) -> Self {
+    pub fn new(txid: Txid) -> Self {
         Self { txid, found: None }
     }
 }

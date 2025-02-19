@@ -6,10 +6,7 @@ use signal_hook::consts::signal::*;
 #[cfg(not(windows))]
 use signal_hook::iterator::Signals;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{error, fmt};
 
 #[cfg(not(windows))]
@@ -26,28 +23,26 @@ impl fmt::Display for ExitError {
 
 impl error::Error for ExitError {}
 
-#[derive(Clone)]
-pub(crate) struct ExitFlag {
-    flag: Arc<AtomicBool>,
+#[derive(Debug, Default)]
+pub struct ExitFlag(AtomicBool);
+
+impl Clone for ExitFlag {
+    fn clone(&self) -> Self {
+        Self(AtomicBool::new(self.0.load(Ordering::Relaxed)))
+    }
 }
 
 impl ExitFlag {
-    fn new() -> Self {
-        ExitFlag {
-            flag: Arc::new(AtomicBool::new(false)),
-        }
+    pub fn new() -> Self {
+        Self(AtomicBool::new(false))
     }
 
-    pub fn poll(&self) -> Result<(), ExitError> {
-        if self.flag.load(Ordering::Relaxed) {
-            Err(ExitError)
-        } else {
-            Ok(())
-        }
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 
-    fn set(&self) {
-        self.flag.store(true, Ordering::Relaxed)
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Relaxed)
     }
 }
 

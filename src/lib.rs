@@ -1,6 +1,7 @@
 #[macro_use]
+extern crate log;
+#[macro_use]
 extern crate anyhow;
-
 #[macro_use]
 extern crate serde_derive;
 
@@ -16,8 +17,8 @@ pub mod atomicals {
     mod metrics;
     mod util;
 
-    pub use protocol::{AtomicalId, AtomicalOperation, AtomicalType, OperationType};
-    pub use state::AtomicalsState;
+    pub use protocol::{AtomicalId, AtomicalOperation, AtomicalType};
+    pub use state::{AtomicalsState, AtomicalOutput};
     pub use storage::AtomicalsStorage;
     pub use rpc::AtomicalsRpc;
     pub use websocket::{WsServer, WsMessage, SubscriptionType, SubscribeRequest};
@@ -47,19 +48,18 @@ pub use crate::daemon::Daemon;
 pub use crate::index::Index;
 pub use crate::mempool::Mempool;
 pub use crate::metrics::Metrics;
-pub use crate::p2p::P2P;
-pub use crate::status::{Status, StatusBackend};
-pub use crate::db::DB;
-pub use crate::cache::Cache;
+pub use electrs_rocksdb::DB;
 
 pub use atomicals::{
     AtomicalId,
     AtomicalOperation,
     AtomicalType,
-    OperationType,
     AtomicalsState,
     AtomicalsStorage,
     AtomicalsRpc,
     AtomicalsIndexer,
     AtomicalsValidator,
 };
+
+pub use signals::ExitFlag;
+pub use types::ScriptHash;

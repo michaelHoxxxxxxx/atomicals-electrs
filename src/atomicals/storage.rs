@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use electrs_rocksdb::{DB, ColumnFamilyDescriptor, Options};
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use anyhow::Result;
+use bitcoin::Txid;
+use electrs_rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use serde::{Deserialize, Serialize};
 
 use super::protocol::AtomicalId;
 use super::state::{AtomicalOutput, OwnerInfo};
@@ -17,7 +17,7 @@ const CF_INDEXES: &str = "indexes";
 /// Atomicals 存储
 pub struct AtomicalsStorage {
     /// RocksDB 实例
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl AtomicalsStorage {
@@ -30,16 +30,16 @@ impl AtomicalsStorage {
         // 创建列族
         let cf_opts = Options::default();
         let cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(CF_STATE, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_OUTPUTS, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(CF_INDEXES, cf_opts),
+            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_STATE, cf_opts.clone()),
+            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_OUTPUTS, cf_opts.clone()),
+            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
+            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_INDEXES, cf_opts),
         ];
         
         // 打开数据库
-        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)?;
+        let db = electrs_rocksdb::DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)?;
         
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     /// 存储状态
@@ -126,7 +126,7 @@ impl AtomicalsStorage {
             .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
         
         let mut indexes = Vec::new();
-        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
         
         for item in iter {
             let (_, value) = item?;
@@ -184,8 +184,8 @@ mod tests {
             location: OutPoint::new(atomical_id.txid, 0),
             spent: false,
             height: 100,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
         }
@@ -272,7 +272,7 @@ mod tests {
         // 测试简单元数据
         let metadata = json!({
             "name": "Test NFT",
-            "description": "Test Description",
+            "description": "Test Description"
         });
         storage.store_metadata(&atomical_id, &metadata)?;
         let retrieved = storage.get_metadata(&atomical_id)?.unwrap();

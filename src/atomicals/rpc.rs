@@ -1,33 +1,31 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use bitcoin::{Address, Network, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
 
-use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
-use super::state::AtomicalsState;
-use super::storage::AtomicalsStorage;
-
-/// Atomicals RPC 处理器
-pub struct AtomicalsRpc {
-    network: Network,
-    state: Arc<AtomicalsState>,
-    storage: Arc<AtomicalsStorage>,
-}
+use crate::atomicals::{
+    AtomicalId, AtomicalOperation, AtomicalType, AtomicalsState,
+    storage::AtomicalsStorage,
+};
 
 /// Atomical 信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicalInfo {
     /// Atomical ID
     pub id: AtomicalId,
-    /// 类型
-    pub atomical_type: AtomicalType,
     /// 所有者地址
-    pub owner: String,
-    /// 值
-    pub value: u64,
+    pub owner: Option<Address>,
     /// 元数据
     pub metadata: Option<Value>,
+    /// 状态
+    pub state: Option<Value>,
+    /// 类型
+    pub atomical_type: AtomicalType,
+    /// 值
+    pub value: u64,
     /// 创建高度
     pub created_height: u32,
     /// 创建时间
@@ -36,8 +34,14 @@ pub struct AtomicalInfo {
     pub sealed: bool,
 }
 
+/// Atomicals RPC 处理器
+pub struct AtomicalsRpc {
+    state: Arc<AtomicalsState>,
+    storage: Arc<AtomicalsStorage>,
+    network: Network,
+}
+
 impl AtomicalsRpc {
-    /// 创建新的 RPC 处理器
     pub fn new(
         network: Network,
         state: Arc<AtomicalsState>,
@@ -68,18 +72,18 @@ impl AtomicalsRpc {
 
         // 转换地址
         let owner = Address::from_script(&bitcoin::Script::from_bytes(&output.owner.script_pubkey), self.network)
-            .map_err(|_| anyhow!("Invalid script"))?
-            .to_string();
+            .map_err(|_| anyhow!("Invalid script"))?;
 
         Ok(AtomicalInfo {
             id: id.clone(),
             atomical_type: AtomicalType::NFT, // 从状态中获取
-            owner,
+            owner: Some(owner),
             value: output.owner.value,
             metadata,
             created_height: output.height,
             created_timestamp: output.timestamp,
             sealed,
+            state: None,
         })
     }
 

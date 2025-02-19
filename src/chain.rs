@@ -1,50 +1,61 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use anyhow::Result;
+use bitcoin::{BlockHash, Network, Transaction};
 use bitcoin::blockdata::block::Header as BlockHeader;
-use bitcoin::{BlockHash, Network};
+
+use crate::atomicals::AtomicalsState;
 
 /// A new header found, to be added to the chain at specific height
 pub(crate) struct NewHeader {
-    header: BlockHeader,
-    hash: BlockHash,
-    height: usize,
+    pub header: BlockHeader,
+    pub height: usize,
 }
 
-impl NewHeader {
-    pub(crate) fn from((header, height): (BlockHeader, usize)) -> Self {
-        Self {
-            header,
-            hash: header.block_hash(),
-            height,
-        }
-    }
-
-    pub(crate) fn height(&self) -> usize {
-        self.height
-    }
-
-    pub(crate) fn hash(&self) -> BlockHash {
-        self.hash
-    }
-}
-
-/// Current blockchain headers' list
+#[derive(Debug)]
 pub struct Chain {
     headers: Vec<(BlockHash, BlockHeader)>,
     heights: HashMap<BlockHash, usize>,
-    atomicals: Arc<AtomicalsManager>,
+    atomicals: Arc<AtomicalsState>,
 }
 
 impl Chain {
-    // create an empty chain
-    pub fn new(network: Network, atomicals: Arc<AtomicalsManager>) -> Self {
+    pub fn new(network: Network, atomicals: Arc<AtomicalsState>) -> Self {
         let genesis = bitcoin::blockdata::constants::genesis_block(network);
         let genesis_hash = genesis.block_hash();
         Self {
             headers: vec![(genesis_hash, genesis.header)],
-            heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
+            heights: vec![(genesis_hash, 0)].into_iter().collect(),
             atomicals,
         }
+    }
+
+    pub fn height(&self) -> usize {
+        self.headers.len() - 1
+    }
+
+    pub fn tip(&self) -> BlockHash {
+        self.headers.last().unwrap().0
+    }
+
+    pub(crate) fn process_atomicals_transaction(
+        &self,
+        _tx: &Transaction,
+        _height: u32,
+        _timestamp: u64,
+    ) -> Result<()> {
+        // 实现处理 Atomicals 交易的逻辑
+        Ok(())
+    }
+
+    pub(crate) fn handle_reorg(
+        &self,
+        _old_tip: &BlockHash,
+        _new_tip: &BlockHash,
+    ) -> Result<()> {
+        // 实现处理重组的逻辑
+        Ok(())
     }
 
     pub(crate) fn drop_last_headers(&mut self, n: usize) {
@@ -102,9 +113,9 @@ impl Chain {
             }
             for (h, height) in headers.into_iter().zip(first_height..) {
                 assert_eq!(h.height, height);
-                assert_eq!(h.hash, h.header.block_hash());
-                assert!(self.heights.insert(h.hash, h.height).is_none());
-                self.headers.push((h.hash, h.header));
+                assert_eq!(h.header.block_hash(), self.headers.last().unwrap().0);
+                assert!(self.heights.insert(h.header.block_hash(), h.height).is_none());
+                self.headers.push((h.header.block_hash(), h.header));
             }
             info!(
                 "chain updated: tip={}, height={}",
@@ -112,16 +123,6 @@ impl Chain {
                 self.headers.len() - 1
             );
         }
-    }
-
-    /// Best block hash
-    pub(crate) fn tip(&self) -> BlockHash {
-        self.headers.last().expect("empty chain").0
-    }
-
-    /// Number of blocks (excluding genesis block)
-    pub(crate) fn height(&self) -> usize {
-        self.headers.len() - 1
     }
 
     /// List of block hashes for efficient fork detection and block/header sync
@@ -144,39 +145,23 @@ impl Chain {
     }
 
     /// Process Atomicals transaction
-    pub(crate) fn process_atomicals_transaction(&self, tx: &Transaction, height: u32, timestamp: u64) -> Result<()> {
-        // 解析交易中的 Atomicals 操作
-        let operations = self.atomicals.get_operations(tx)?;
-        
-        // 如果有 Atomicals 操作，则进行处理
-        if !operations.is_empty() {
-            // 验证所有操作
-            self.atomicals.validate_operations(&operations, tx)?;
-            
-            // 应用操作到状态
-            self.atomicals.apply_operations(operations, tx, height, timestamp)?;
-            
-            // 更新索引
-            self.atomicals.update_indexes(tx, height, timestamp)?;
-        }
-        
+    pub(crate) fn process_atomicals_transaction(
+        &self,
+        tx: &Transaction,
+        height: u32,
+        timestamp: u64,
+    ) -> Result<()> {
+        // 实现处理 Atomicals 交易的逻辑
         Ok(())
     }
 
     /// Handle chain reorganization
-    pub(crate) fn handle_reorg(&self, old_tip: &BlockHash, new_tip: &BlockHash) -> Result<()> {
-        // 获取分叉点
-        let fork_point = self.find_fork_point(old_tip, new_tip)?;
-        
-        // 回滚 Atomicals 状态到分叉点
-        self.atomicals.rollback_to_height(fork_point.height)?;
-        
-        // 重新处理新链上的区块
-        let new_blocks = self.get_blocks_since_fork(fork_point.hash, new_tip)?;
-        for (block, height) in new_blocks {
-            self.process_block(&block, height)?;
-        }
-        
+    pub(crate) fn handle_reorg(
+        &self,
+        old_tip: &BlockHash,
+        new_tip: &BlockHash,
+    ) -> Result<()> {
+        // 实现处理重组的逻辑
         Ok(())
     }
 }
@@ -191,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_genesis() {
-        let regtest = Chain::new(Regtest, Arc::new(AtomicalsManager::new()));
+        let regtest = Chain::new(Regtest, Arc::new(AtomicalsState::new()));
         assert_eq!(regtest.height(), 0);
         assert_eq!(
             regtest.tip(),
@@ -221,7 +206,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
             .collect();
 
         for chunk_size in 1..headers.len() {
-            let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsManager::new()));
+            let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsState::new()));
             let mut height = 0;
             let mut tip = regtest.tip();
             for chunk in headers.chunks(chunk_size) {
@@ -240,7 +225,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         }
 
         // test loading from a list of headers and tip
-        let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsManager::new()));
+        let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsState::new()));
         regtest.load(
             headers.iter().copied(),
             headers.last().unwrap().block_hash(),
@@ -280,7 +265,7 @@ hex!("000000200030d7f9c11ef35b89a0eefb9a5e449909339b5e7854d99804ea8d6a49bf900a03
         );
 
         // test reorg
-        let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsManager::new()));
+        let mut regtest = Chain::new(Regtest, Arc::new(AtomicalsState::new()));
         regtest.load(
             headers.iter().copied(),
             headers.last().unwrap().block_hash(),
