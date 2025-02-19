@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use anyhow::{anyhow, Result};
-use bitcoin::{OutPoint, Address};
+use bitcoin::{OutPoint, Address, TxOut};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 use std::sync::Arc;
 
 use super::protocol::{AtomicalId, AtomicalType};
-use super::state::{AtomicalOutput, OwnerInfo};
+use super::state::AtomicalOutput;
 use super::storage::AtomicalsStorage;
 
 /// 索引类型
@@ -266,21 +266,21 @@ mod tests {
 
     fn create_test_output(atomical_id: &AtomicalId, value: u64) -> AtomicalOutput {
         let mut rng = rand::thread_rng();
-        let mut script = vec![0; 32];
+        let mut script = vec![0u8; 32];
         rng.fill(&mut script[..]);
 
         AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: script,
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
                 value,
+                script_pubkey: bitcoin::Script::from_bytes(&script),
             },
-            atomical_id: atomical_id.clone(),
-            metadata: Some(json!({
-                "name": "Test NFT",
-                "description": "Test Description"
-            })),
+            metadata: None,
             height: 100,
             timestamp: 1234567890,
+            atomical_type: AtomicalType::NFT,
+            sealed: false,
         }
     }
 
@@ -349,7 +349,7 @@ mod tests {
         let outputs = indexer.find_by_address(&address)?;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].atomical_id, id);
-        assert_eq!(outputs[0].owner.value, 1000);
+        assert_eq!(outputs[0].output.value, 1000);
 
         // 测试不存在的地址
         let nonexistent = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt081")?;

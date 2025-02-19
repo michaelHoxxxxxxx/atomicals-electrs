@@ -2,246 +2,214 @@ use std::collections::HashMap;
 use tokio::sync::{RwLock, broadcast};
 use serde::{Serialize, Deserialize};
 use anyhow::Result;
-use bitcoin::{Transaction, TxOut, OutPoint, Txid, Amount};
+use bitcoin::{Transaction, TxOut, OutPoint, Address};
 use serde_json::Value;
 use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
-use super::tx_parser;
 use super::websocket::{WsMessage, AtomicalUpdate, UpdateType, OperationNotification, OperationStatus};
 
-/// Atomical 所有者信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OwnerInfo {
-    /// 脚本公钥
-    pub script_pubkey: Vec<u8>,
-    /// 值
-    pub value: u64,
-}
-
-/// Atomical 输出
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AtomicalOutput {
-    /// 所有者信息
-    pub owner: OwnerInfo,
-    /// Atomical ID
-    pub atomical_id: AtomicalId,
-    /// 元数据
-    pub metadata: Option<Value>,
-    /// 位置
-    pub location: OutPoint,
-    /// 是否花费
-    pub spent: bool,
-    /// 区块高度
+    pub txid: bitcoin::Txid,
+    pub vout: u32,
+    pub output: TxOut,
+    pub metadata: Value,
     pub height: u32,
-    /// 时间戳
     pub timestamp: u64,
+    pub atomical_type: AtomicalType,
+    pub sealed: bool,
 }
 
-/// Atomicals 状态
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct AtomicalsState {
-    /// 所有 Atomicals 的输出
     outputs: RwLock<HashMap<AtomicalId, AtomicalOutput>>,
-    /// 已封印的 Atomicals
     sealed: RwLock<HashMap<AtomicalId, bool>>,
-    /// 元数据
     metadata: RwLock<HashMap<AtomicalId, Value>>,
-    /// WebSocket 广播通道
     broadcast_tx: broadcast::Sender<WsMessage>,
+    network: bitcoin::Network,
 }
 
 impl AtomicalsState {
-    /// 创建新的状态
-    pub async fn new() -> Result<Self> {
+    pub async fn new(network: bitcoin::Network) -> Result<Self> {
         let (broadcast_tx, _) = broadcast::channel(1024);
-        
         Ok(Self {
             outputs: RwLock::new(HashMap::new()),
             sealed: RwLock::new(HashMap::new()),
             metadata: RwLock::new(HashMap::new()),
             broadcast_tx,
+            network,
         })
     }
 
-    /// 检查 Atomical 是否存在
-    pub async fn exists(&self, atomical_id: &AtomicalId) -> Result<bool> {
-        let outputs = self.outputs.read().await;
-        Ok(outputs.contains_key(atomical_id))
-    }
-
-    /// 检查 Atomical 是否已被封印
-    pub async fn is_sealed(&self, atomical_id: &AtomicalId) -> Result<bool> {
-        let sealed = self.sealed.read().await;
-        Ok(sealed.get(atomical_id).copied().unwrap_or(false))
-    }
-
-    /// 获取 Atomical 输出
     pub async fn get_output(&self, atomical_id: &AtomicalId) -> Result<Option<AtomicalOutput>> {
         let outputs = self.outputs.read().await;
         Ok(outputs.get(atomical_id).cloned())
     }
 
-    /// 获取 Atomical 元数据
     pub async fn get_metadata(&self, atomical_id: &AtomicalId) -> Result<Option<Value>> {
         let metadata = self.metadata.read().await;
         Ok(metadata.get(atomical_id).cloned())
     }
 
-    /// 获取交易中的 Atomicals 操作
-    pub async fn get_operations(&self, tx: &Transaction) -> Result<Vec<AtomicalOperation>> {
-        tx_parser::parse_transaction(tx)
+    pub async fn get_atomical_info(&self, id: &AtomicalId) -> Result<AtomicalInfo> {
+        let outputs = self.outputs.read().await;
+        let output = outputs.get(id).ok_or_else(|| anyhow::anyhow!("Atomical not found"))?;
+        
+        let metadata = self.metadata.read().await;
+        let metadata_value = metadata.get(id).cloned();
+        
+        let sealed = self.sealed.read().await;
+        let is_sealed = sealed.get(id).cloned().unwrap_or(false);
+        
+        Ok(AtomicalInfo {
+            id: id.clone(),
+            owner: Address::from_script(&output.output.script_pubkey, self.network).ok(),
+            metadata: metadata_value,
+            state: None,
+            atomical_type: output.atomical_type.clone(),
+            value: output.output.value.to_sat(),
+            created_height: output.height,
+            created_timestamp: output.timestamp,
+            sealed: is_sealed,
+        })
     }
 
-    /// 应用操作
     pub async fn apply_operations(&mut self, operations: Vec<AtomicalOperation>, tx: &Transaction, height: u32, timestamp: u64) -> Result<()> {
+        let operations_clone = operations.clone();
         for operation in operations {
             match operation {
-                AtomicalOperation::Mint { atomical_type: _, metadata } => {
+                AtomicalOperation::Mint { atomical_type, metadata } => {
                     let atomical_id = AtomicalId {
                         txid: tx.compute_txid(),
                         vout: 0,
                     };
 
                     let output = AtomicalOutput {
-                        owner: OwnerInfo {
-                            script_pubkey: tx.output[0].script_pubkey.to_bytes(),
-                            value: tx.output[0].value.to_sat(),
-                        },
-                        atomical_id: atomical_id.clone(),
-                        metadata: metadata.as_ref().map(|m| m.clone()),
-                        location: OutPoint::new(tx.compute_txid(), 0),
-                        spent: false,
+                        txid: tx.compute_txid(),
+                        vout: 0,
+                        output: tx.output[0].clone(),
+                        metadata: metadata.clone(),
                         height,
                         timestamp,
+                        atomical_type: atomical_type.clone(),
+                        sealed: false,
                     };
 
                     self.outputs.write().await.insert(atomical_id.clone(), output);
-                    if let Some(m) = metadata {
-                        self.metadata.write().await.insert(atomical_id.clone(), m);
-                    }
-                    
-                    // 发送状态更新通知
+                    self.metadata.write().await.insert(atomical_id.clone(), metadata.clone());
                     self.notify_state_update(&atomical_id).await?;
                 }
                 AtomicalOperation::Update { atomical_id, metadata } => {
                     if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
-                        output.metadata = Some(metadata.clone());
-                        self.metadata.write().await.insert(atomical_id.clone(), metadata);
+                        output.metadata = metadata.clone();
+                        self.metadata.write().await.insert(atomical_id.clone(), metadata.clone());
                     }
                     
-                    // 发送状态更新通知
                     self.notify_state_update(&atomical_id).await?;
                 }
                 AtomicalOperation::Seal { atomical_id } => {
-                    self.sealed.write().await.insert(atomical_id, true);
+                    if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
+                        output.sealed = true;
+                    }
+                    self.sealed.write().await.insert(atomical_id.clone(), true);
                     
-                    // 发送封印状态变更通知
                     self.notify_seal_status_change(&atomical_id, true).await?;
                 }
                 AtomicalOperation::Transfer { atomical_id, output_index } => {
                     if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
-                        output.owner = OwnerInfo {
-                            script_pubkey: tx.output[output_index as usize].script_pubkey.to_bytes(),
-                            value: tx.output[output_index as usize].value.to_sat(),
-                        };
-                        output.location = OutPoint::new(tx.txid(), output_index);
+                        output.output = tx.output[output_index as usize].clone();
                         output.height = height;
                         output.timestamp = timestamp;
                     }
                     
-                    // 发送所有权变更通知
                     self.notify_ownership_change(&atomical_id, &tx.output[output_index as usize]).await?;
                 }
             }
         }
-        
-        // 发送操作通知
-        self.notify_operation(&operations, tx.txid().to_string(), Some(height)).await?;
-        
+
+        self.notify_operation(&operations_clone, tx.compute_txid().to_string(), Some(height)).await?;
         Ok(())
     }
-    
-    // WebSocket 通知方法
-    
-    /// 通知所有权变更
-    async fn notify_ownership_change(&self, id: &AtomicalId, new_output: &TxOut) -> Result<()> {
-        let update = AtomicalUpdate {
-            id: id.clone(),
-            info: self.get_atomical_info(id).await?,
-            update_type: UpdateType::OwnershipChange,
-        };
-        
-        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
-            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
-            
-        Ok(())
+
+    pub fn broadcast_tx(&self) -> broadcast::Sender<WsMessage> {
+        self.broadcast_tx.clone()
     }
-    
-    /// 通知状态更新
+
     async fn notify_state_update(&self, id: &AtomicalId) -> Result<()> {
         let update = AtomicalUpdate {
             id: id.clone(),
-            info: self.get_atomical_info(id).await?,
+            info: self.get_atomical_info(id).await?.into(),
             update_type: UpdateType::StateUpdate,
         };
         
-        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
-            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
-            
+        let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
         Ok(())
     }
-    
-    /// 通知封印状态变更
+
     async fn notify_seal_status_change(&self, id: &AtomicalId, sealed: bool) -> Result<()> {
         let update = AtomicalUpdate {
             id: id.clone(),
-            info: self.get_atomical_info(id).await?,
+            info: self.get_atomical_info(id).await?.into(),
             update_type: UpdateType::SealStatusChange,
         };
         
-        self.broadcast_tx.send(WsMessage::AtomicalUpdate(update))
-            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
-            
+        let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
         Ok(())
     }
-    
-    /// 通知新操作
+
+    async fn notify_ownership_change(&self, id: &AtomicalId, new_output: &TxOut) -> Result<()> {
+        let update = AtomicalUpdate {
+            id: id.clone(),
+            info: self.get_atomical_info(id).await?.into(),
+            update_type: UpdateType::OwnershipChange,
+        };
+        
+        let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
+        Ok(())
+    }
+
     async fn notify_operation(&self, operations: &Vec<AtomicalOperation>, txid: String, height: Option<u32>) -> Result<()> {
         let status = match height {
             Some(h) => OperationStatus::Confirmed(h),
             None => OperationStatus::Unconfirmed,
         };
-        
+
         let notification = OperationNotification {
             txid,
             operations: operations.clone(),
             status,
         };
-        
-        self.broadcast_tx.send(WsMessage::NewOperation(notification))
-            .map_err(|e| anyhow!("Broadcast error: {}", e))?;
-            
+
+        let _ = self.broadcast_tx.send(WsMessage::OperationNotification(notification));
         Ok(())
     }
-    
-    /// 获取广播发送器
-    pub fn broadcast_tx(&self) -> broadcast::Sender<WsMessage> {
-        self.broadcast_tx.clone()
-    }
-    
-    /// 获取 Atomical 信息
-    async fn get_atomical_info(&self, id: &AtomicalId) -> Result<Value> {
-        let outputs = self.outputs.read().await;
-        let output = outputs.get(id).unwrap();
-        let metadata = self.metadata.read().await.get(id).cloned();
-        
-        Ok(serde_json::json!({
-            "owner": output.owner,
-            "metadata": metadata,
-            "location": output.location,
-            "spent": output.spent,
-            "height": output.height,
-            "timestamp": output.timestamp,
-        }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtomicalInfo {
+    pub id: AtomicalId,
+    pub owner: Option<Address>,
+    pub metadata: Option<Value>,
+    pub state: Option<String>,
+    pub atomical_type: AtomicalType,
+    pub value: u64,
+    pub created_height: u32,
+    pub created_timestamp: u64,
+    pub sealed: bool,
+}
+
+impl From<AtomicalInfo> for super::rpc::AtomicalInfo {
+    fn from(info: AtomicalInfo) -> Self {
+        super::rpc::AtomicalInfo {
+            id: info.id,
+            owner: info.owner,
+            metadata: info.metadata,
+            state: info.state,
+            atomical_type: info.atomical_type,
+            value: info.value,
+            created_height: info.created_height,
+            created_timestamp: info.created_timestamp,
+            sealed: info.sealed,
+        }
     }
 }
 
@@ -275,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_creation() -> Result<()> {
-        let state = AtomicalsState::new().await?;
+        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         assert!(state.outputs.read().await.is_empty());
         assert!(state.sealed.read().await.is_empty());
         assert!(state.metadata.read().await.is_empty());
@@ -284,78 +252,79 @@ mod tests {
 
     #[tokio::test]
     async fn test_atomical_existence() -> Result<()> {
-        let state = AtomicalsState::new().await?;
+        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试不存在的 Atomical
-        assert!(!state.exists(&atomical_id).await?);
+        assert!(!state.get_output(&atomical_id).await?.is_some());
 
         // 添加 Atomical
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: vec![],
-                value: 1000,
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
+                value: Amount::from_sat(1000).to_sat(),
+                script_pubkey: Builder::new().into_script(),
             },
-            atomical_id: atomical_id.clone(),
-            metadata: None,
-            location: OutPoint::new(atomical_id.txid, 0),
-            spent: false,
+            metadata: serde_json::json!({}),
             height: 0,
             timestamp: 0,
+            atomical_type: AtomicalType::NFT,
+            sealed: false,
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
 
         // 测试存在的 Atomical
-        assert!(state.exists(&atomical_id).await?);
+        assert!(state.get_output(&atomical_id).await?.is_some());
         Ok(())
     }
 
     #[tokio::test]
     async fn test_seal_operations() -> Result<()> {
-        let state = AtomicalsState::new().await?;
+        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试未封印状态
-        assert!(!state.is_sealed(&atomical_id).await?);
+        assert!(!state.sealed.read().await.contains_key(&atomical_id));
 
         // 封印 Atomical
         state.sealed.write().await.insert(atomical_id.clone(), true);
 
         // 测试已封印状态
-        assert!(state.is_sealed(&atomical_id).await?);
+        assert!(state.sealed.read().await.contains_key(&atomical_id));
         Ok(())
     }
 
     #[tokio::test]
     async fn test_output_management() -> Result<()> {
-        let state = AtomicalsState::new().await?;
+        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试获取不存在的输出
-        assert!(state.get_output(&atomical_id).await?.is_none());
+        assert!(!state.get_output(&atomical_id).await?.is_some());
 
         // 添加输出
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: vec![1, 2, 3],
-                value: 1000,
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
+                value: Amount::from_sat(1000).to_sat(),
+                script_pubkey: Builder::new().into_script(),
             },
-            atomical_id: atomical_id.clone(),
-            metadata: Some(serde_json::json!({
+            metadata: serde_json::json!({
                 "name": "Test NFT",
                 "description": "Test Description"
-            })),
-            location: OutPoint::new(atomical_id.txid, 0),
-            spent: false,
+            }),
             height: 100,
             timestamp: 1234567890,
+            atomical_type: AtomicalType::NFT,
+            sealed: false,
         };
         state.outputs.write().await.insert(atomical_id.clone(), output.clone());
 
         // 测试获取存在的输出
         let retrieved_output = state.get_output(&atomical_id).await?.unwrap();
-        assert_eq!(retrieved_output.owner.value, 1000);
-        assert_eq!(retrieved_output.owner.script_pubkey, vec![1, 2, 3]);
+        assert_eq!(retrieved_output.output.value, 1000);
         assert_eq!(retrieved_output.height, 100);
         assert_eq!(retrieved_output.timestamp, 1234567890);
         Ok(())
@@ -363,11 +332,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_metadata_management() -> Result<()> {
-        let state = AtomicalsState::new().await?;
+        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试获取不存在的元数据
-        assert!(state.get_metadata(&atomical_id).await?.is_none());
+        assert!(!state.get_metadata(&atomical_id).await?.is_some());
 
         // 添加带元数据的输出
         let metadata = serde_json::json!({
@@ -379,16 +348,17 @@ mod tests {
             }
         });
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: vec![],
-                value: 1000,
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
+                value: Amount::from_sat(1000).to_sat(),
+                script_pubkey: Builder::new().into_script(),
             },
-            atomical_id: atomical_id.clone(),
-            metadata: Some(metadata.clone()),
-            location: OutPoint::new(atomical_id.txid, 0),
-            spent: false,
+            metadata: metadata.clone(),
             height: 0,
             timestamp: 0,
+            atomical_type: AtomicalType::NFT,
+            sealed: false,
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
         state.metadata.write().await.insert(atomical_id.clone(), metadata);
@@ -401,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_operation_application() -> Result<()> {
-        let mut state = AtomicalsState::new().await?;
+        let mut state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let tx = create_test_transaction();
         let height = 100;
         let timestamp = 1234567890;
@@ -419,11 +389,11 @@ mod tests {
 
         // 验证铸造结果
         let atomical_id = AtomicalId {
-            txid: tx.txid(),
+            txid: tx.compute_txid(),
             vout: 0,
         };
         let output = state.get_output(&atomical_id).await?.unwrap();
-        assert_eq!(output.metadata.unwrap(), mint_metadata);
+        assert_eq!(output.metadata, mint_metadata);
         assert_eq!(output.height, height);
         assert_eq!(output.timestamp, timestamp);
 
@@ -440,7 +410,7 @@ mod tests {
 
         // 验证更新结果
         let updated_output = state.get_output(&atomical_id).await?.unwrap();
-        assert_eq!(updated_output.metadata.unwrap(), update_metadata);
+        assert_eq!(updated_output.metadata, update_metadata);
 
         // 测试封印操作
         let seal_op = AtomicalOperation::Seal {
@@ -449,7 +419,7 @@ mod tests {
         state.apply_operations(vec![seal_op], &tx, height + 2, timestamp + 7200).await?;
 
         // 验证封印结果
-        assert!(state.is_sealed(&atomical_id).await?);
+        assert!(state.sealed.read().await.contains_key(&atomical_id));
 
         // 测试转移操作
         let transfer_op = AtomicalOperation::Transfer {
@@ -467,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_notifications() -> Result<()> {
-        let mut state = AtomicalsState::new().await?;
+        let mut state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
         let atomical_id = create_test_atomical_id();
         let tx = create_test_transaction();
 
@@ -510,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_operations() -> Result<()> {
-        let state = Arc::new(AtomicalsState::new().await?);
+        let state = Arc::new(AtomicalsState::new(bitcoin::Network::Testnet).await?);
         let atomical_id = create_test_atomical_id();
         let tx = create_test_transaction();
 
