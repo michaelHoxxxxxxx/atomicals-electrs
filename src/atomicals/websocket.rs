@@ -397,7 +397,16 @@ impl WsServer {
             while let Some(msg) = rx.next().await {
                 // 压缩发送的消息
                 if let Ok(compressed_msg) = self.message_handler.handle_outgoing(msg) {
-                    if ws_tx.send(compressed_msg).await.is_err() {
+                    // 将 tungstenite::Message 转换为 warp::ws::Message
+                    let warp_msg = match compressed_msg {
+                        tokio_tungstenite::tungstenite::Message::Text(text) => warp::ws::Message::text(text),
+                        tokio_tungstenite::tungstenite::Message::Binary(data) => warp::ws::Message::binary(data),
+                        tokio_tungstenite::tungstenite::Message::Ping(data) => warp::ws::Message::ping(data),
+                        tokio_tungstenite::tungstenite::Message::Pong(data) => warp::ws::Message::pong(data),
+                        tokio_tungstenite::tungstenite::Message::Close(_) => warp::ws::Message::close(),
+                        _ => continue,
+                    };
+                    if ws_tx.send(warp_msg).await.is_err() {
                         break;
                     }
                 }
@@ -410,11 +419,38 @@ impl WsServer {
             while let Some(result) = ws_rx.next().await {
                 if let Ok(msg) = result {
                     let start = Instant::now();
-                    let compressed_size = msg.len();
+                    let compressed_size = if let Ok(text) = msg.to_str() {
+                        text.len()
+                    } else if let Some(data) = msg.as_bytes() {
+                        data.len()
+                    } else {
+                        0
+                    };
+
+                    // 将 warp::ws::Message 转换为 tungstenite::Message
+                    let tungstenite_msg = if let Ok(text) = msg.to_str() {
+                        tokio_tungstenite::tungstenite::Message::Text(text.to_string())
+                    } else if let Some(data) = msg.as_bytes() {
+                        tokio_tungstenite::tungstenite::Message::Binary(data.to_vec())
+                    } else if msg.is_ping() {
+                        tokio_tungstenite::tungstenite::Message::Ping(vec![])
+                    } else if msg.is_pong() {
+                        tokio_tungstenite::tungstenite::Message::Pong(vec![])
+                    } else if msg.is_close() {
+                        tokio_tungstenite::tungstenite::Message::Close(None)
+                    } else {
+                        continue;
+                    };
 
                     // 解压接收的消息
-                    if let Ok(decompressed_msg) = server.message_handler.handle_incoming(msg) {
-                        let original_size = decompressed_msg.len();
+                    if let Ok(decompressed_msg) = server.message_handler.handle_incoming(tungstenite_msg) {
+                        let original_size = if let Ok(text) = decompressed_msg.to_str() {
+                            text.len()
+                        } else if let Some(data) = decompressed_msg.as_bytes() {
+                            data.len()
+                        } else {
+                            0
+                        };
                         server.metrics.record_decompression(compressed_size, original_size);
                         server.metrics.record_message_received(original_size);
 
@@ -430,7 +466,7 @@ impl WsServer {
                         }
 
                         // 处理消息
-                        if let Message::Text(text) = decompressed_msg {
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = decompressed_msg {
                             let msg_start = Instant::now();
                             if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                                 match ws_msg {
@@ -658,29 +694,29 @@ impl WsServer {
 /// WebSocket 配置结构体
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketConfig {
-    /// WebSocket 心跳间隔（秒）
-    pub heartbeat_interval: Option<u64>,
-    /// WebSocket 最大连接数
-    pub max_connections: Option<usize>,
-    /// WebSocket 连接超时时间（秒）
-    pub connection_timeout: Option<u64>,
+    /// 最大连接数
+    pub max_connections: usize,
+    /// 心跳超时时间 (秒)
+    pub heartbeat_timeout: u64,
+    /// 认证超时时间 (秒)
+    pub auth_timeout: u64,
+    /// 压缩等级
+    pub compression_level: CompressionLevel,
+    /// 压缩阈值 (字节)
+    pub compression_threshold: usize,
     /// JWT 密钥
-    pub jwt_secret: Option<String>,
-    /// 压缩级别
-    pub compression_level: Option<CompressionLevel>,
-    /// 压缩阈值（字节）
-    pub compression_threshold: Option<usize>,
+    pub jwt_secret: String,
 }
 
 impl Default for WebSocketConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Some(30),
-            max_connections: Some(1000),
-            connection_timeout: Some(300),
-            jwt_secret: None,
-            compression_level: Some(CompressionLevel::Default),
-            compression_threshold: Some(1024),
+            max_connections: 1000,
+            heartbeat_timeout: 30,
+            auth_timeout: 10,
+            compression_level: CompressionLevel::Default,
+            compression_threshold: 1024,
+            jwt_secret: "".to_string(),
         }
     }
 }
@@ -698,14 +734,14 @@ mod tests {
     fn create_test_config() -> AppConfig {
         AppConfig {
             websocket_config: WebSocketConfig {
-                jwt_secret: Some("test_secret".to_string()),
-                max_connections: Some(100),
-                max_subscriptions_per_connection: Some(10),
-                connection_timeout: Some(Duration::from_secs(60).as_secs() as u64),
-                compression_level: Some(CompressionLevel::Fast),
-                compression_threshold: Some(1024),
-                heartbeat_interval: Some(Duration::from_secs(30).as_secs() as u64),
-                cleanup_interval: Some(Duration::from_secs(60).as_secs() as u64),
+                jwt_secret: "test_secret".to_string(),
+                max_connections: 100,
+                max_subscriptions_per_connection: 10,
+                connection_timeout: 60,
+                compression_level: CompressionLevel::Fast,
+                compression_threshold: 1024,
+                heartbeat_interval: 30,
+                cleanup_interval: 60,
             },
         }
     }
@@ -828,9 +864,8 @@ mod tests {
     fn test_config() {
         let config = WebSocketConfig::default();
         assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.connection_timeout, 300);
+        assert_eq!(config.heartbeat_timeout, 30);
         assert_eq!(config.compression_threshold, 1024);
-        assert_eq!(config.heartbeat_interval, 30);
     }
 
     #[test]
@@ -905,7 +940,7 @@ mod tests {
         assert!(!sub_id.is_empty());
 
         // 测试超出最大订阅数
-        for _ in 0..config.websocket_config.max_connections.unwrap_or(1000) {
+        for _ in 0..config.websocket_config.max_connections {
             let req = SubscribeRequest {
                 id: AtomicalId {
                     txid: bitcoin::Txid::from_str(

@@ -87,7 +87,7 @@ impl AtomicalsState {
                         txid: tx.compute_txid(),
                         vout: 0,
                         output: tx.output[0].clone(),
-                        metadata: metadata.clone(),
+                        metadata: metadata.clone().map_or(serde_json::json!({}), |m| m),
                         height,
                         timestamp,
                         atomical_type: atomical_type.clone(),
@@ -95,13 +95,16 @@ impl AtomicalsState {
                     };
 
                     self.outputs.write().await.insert(atomical_id.clone(), output);
-                    self.metadata.write().await.insert(atomical_id.clone(), metadata.clone());
+                    if let Some(m) = metadata {
+                        self.metadata.write().await.insert(atomical_id.clone(), m);
+                    }
                     self.notify_state_update(&atomical_id).await?;
                 }
                 AtomicalOperation::Update { atomical_id, metadata } => {
                     if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
-                        output.metadata = metadata.clone();
-                        self.metadata.write().await.insert(atomical_id.clone(), metadata.clone());
+                        let m = metadata.clone().map_or(serde_json::json!({}), |m| m);
+                        output.metadata = m.clone();
+                        self.metadata.write().await.insert(atomical_id.clone(), m);
                     }
                     
                     self.notify_state_update(&atomical_id).await?;
@@ -175,11 +178,11 @@ impl AtomicalsState {
 
         let notification = OperationNotification {
             txid,
-            operations: operations.clone(),
+            operation: operations[0].clone(), // 假设只处理第一个操作
             status,
         };
-
-        let _ = self.broadcast_tx.send(WsMessage::OperationNotification(notification));
+        
+        let _ = self.broadcast_tx.send(WsMessage::NewOperation(notification));
         Ok(())
     }
 }
