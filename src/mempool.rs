@@ -21,6 +21,7 @@ pub struct Entry {
     pub fee: Amount,
     pub vsize: u64,
     pub has_unconfirmed_inputs: bool,
+    pub fee_per_vbyte: f32,
 }
 
 /// Mempool current state
@@ -35,6 +36,14 @@ pub struct Mempool {
     atomicals: Arc<AtomicalsState>,
     pending_operations: RwLock<HashMap<Txid, Vec<AtomicalOperation>>>,
     fee_histogram: FeeHistogram,
+    stats: RwLock<Stats>,
+}
+
+#[derive(Debug, Default)]
+struct Stats {
+    vsize: f32,
+    fee: u64,
+    count: usize,
 }
 
 impl Mempool {
@@ -56,6 +65,7 @@ impl Mempool {
             atomicals,
             pending_operations: RwLock::new(HashMap::new()),
             fee_histogram: FeeHistogram::new(),
+            stats: RwLock::new(Stats::default()),
         }
     }
 
@@ -122,6 +132,7 @@ impl Mempool {
                         fee: Amount::from_sat(entry.fee),
                         vsize: entry.vsize,
                         has_unconfirmed_inputs,
+                        fee_per_vbyte: entry.fee as f32 / entry.vsize as f32,
                     };
 
                     // Update indexes
@@ -172,6 +183,103 @@ impl Mempool {
         }
         
         self.fee_histogram = histogram;
+    }
+
+    async fn update_fee_histogram(&mut self) -> Result<()> {
+        let mut entries: Vec<Entry> = self.entries.values().cloned().collect();
+        entries.sort_unstable_by(|a, b| a.fee_per_vbyte.partial_cmp(&b.fee_per_vbyte).unwrap());
+
+        let mut histogram = self.fee_histogram.write().await;
+        histogram.clear();
+        let mut vsize_sum = 0f32;
+
+        for entry in entries.iter() {
+            if let Ok(operations) = self.atomicals.get_atomical_operations(&entry.tx).await {
+                if !operations.is_empty() {
+                    vsize_sum += entry.tx.vsize() as f32;
+                    histogram.push((entry.fee_per_vbyte, vsize_sum));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn update_stats(&mut self) -> Result<()> {
+        let mut vsize = 0f32;
+        let mut fee = 0u64;
+        let mut count = 0usize;
+
+        for entry in self.entries.values() {
+            let tx = &entry.tx;
+            let tx_vsize = tx.vsize() as f32;
+            vsize += tx_vsize;
+            fee += entry.fee;
+            count += 1;
+        }
+
+        let mut stats = self.stats.write().await;
+        stats.vsize = vsize;
+        stats.fee = fee;
+        stats.count = count;
+
+        Ok(())
+    }
+
+    pub async fn update(&mut self, exit_flag: &ExitFlag) -> Result<()> {
+        // 获取新的 mempool 交易
+        let new_txids = self.daemon.get_mempool_txids().await?;
+        let mut missing_txids = new_txids
+            .iter()
+            .filter(|txid| !self.entries.contains_key(&txid))
+            .cloned()
+            .collect::<Vec<Txid>>();
+
+        // 获取新交易详情
+        while !missing_txids.is_empty() {
+            let batch = missing_txids.split_off(
+                missing_txids.len().saturating_sub(1000),
+            );
+            let txs = self.daemon.get_mempool_txs(&batch).await?;
+            for tx in txs {
+                let txid = tx.txid();
+                let fee = self.daemon.get_mempool_tx_fee(&txid).await?;
+                let vsize = tx.vsize() as f32;
+                let fee_per_vbyte = fee as f32 / vsize;
+
+                self.entries.insert(
+                    txid,
+                    Entry {
+                        tx,
+                        fee,
+                        vsize: tx.vsize(),
+                        has_unconfirmed_inputs: tx
+                            .input
+                            .iter()
+                            .any(|txin| self.entries.contains_key(&txin.previous_output.txid)),
+                        fee_per_vbyte,
+                    },
+                );
+            }
+            exit_flag.check().context("mempool update interrupted")?;
+        }
+
+        // 移除已确认或过期的交易
+        let mut removed = Vec::new();
+        for txid in self.entries.keys() {
+            if !new_txids.contains(txid) {
+                removed.push(*txid);
+            }
+        }
+        for txid in removed {
+            self.entries.remove(&txid);
+        }
+
+        // 更新统计信息
+        self.update_stats().await?;
+        self.update_fee_histogram().await?;
+
+        Ok(())
     }
 }
 
@@ -260,6 +368,7 @@ impl MempoolSyncUpdate {
                         vsize: entry.vsize,
                         fee: entry.fees.base,
                         has_unconfirmed_inputs: !entry.depends.is_empty(),
+                        fee_per_vbyte: entry.fees.base as f32 / entry.vsize as f32,
                     })
                 })
                 .collect();

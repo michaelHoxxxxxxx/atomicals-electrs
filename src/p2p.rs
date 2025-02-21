@@ -86,7 +86,7 @@ impl Connection {
         Ok(headers
             .into_iter()
             .zip(new_heights)
-            .map(NewHeader::from)
+            .map(|(header, height)| NewHeader { header, height })
             .collect())
     }
 

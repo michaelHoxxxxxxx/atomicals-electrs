@@ -1,26 +1,43 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
-
-use anyhow::{anyhow, Result};
-use bytes::Bytes;
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use futures::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::RwLock;
+use warp::ws::{Message as WarpMessage, WebSocket, Ws};
+use warp::Filter;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tokio::time;
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use anyhow::{anyhow, Result};
+use log::{error, info};
+use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
-use warp::Filter;
-use warp::ws::{WebSocket, Ws};
+use bytes::Bytes;
+use flate2::Compression;
 
-use crate::atomicals::{AtomicalId, AtomicalOperation};
-use crate::atomicals::rpc::AtomicalInfo;
+use crate::atomicals::state::AtomicalsState;
+use crate::atomicals::protocol::{AtomicalId, AtomicalOperation};
 use crate::atomicals::metrics::{WebSocketMetrics, LatencyType, ErrorType};
-use crate::atomicals::AtomicalsState;
-use crate::config::Config as AppConfig;
+use crate::atomicals::rpc::AtomicalInfo;
+
+#[derive(Debug, Clone, Copy)]
+pub enum CompressionLevel {
+    None,
+    Fast,
+    Default,
+    Best,
+}
+
+impl From<CompressionLevel> for Compression {
+    fn from(level: CompressionLevel) -> Self {
+        match level {
+            CompressionLevel::None => Compression::none(),
+            CompressionLevel::Fast => Compression::fast(),
+            CompressionLevel::Default => Compression::default(),
+            CompressionLevel::Best => Compression::best(),
+        }
+    }
+}
 
 /// 认证令牌声明
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,46 +117,19 @@ pub enum SubscriptionType {
     All,
 }
 
-/// Atomical 更新通知
+/// 订阅更新消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicalUpdate {
-    /// Atomical ID
     pub id: AtomicalId,
-    /// 更新后的信息
     pub info: AtomicalInfo,
-    /// 更新类型
-    pub update_type: UpdateType,
 }
 
-/// 操作通知
+/// 操作通知消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationNotification {
-    /// 交易 ID
-    pub txid: String,
-    /// 操作类型
+    pub id: AtomicalId,
     pub operation: AtomicalOperation,
-    /// 状态 (确认/未确认)
-    pub status: OperationStatus,
-}
-
-/// 更新类型
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UpdateType {
-    /// 所有权变更
-    OwnershipChange,
-    /// 状态更新
-    StateUpdate,
-    /// 封印状态变更
-    SealStatusChange,
-}
-
-/// 操作状态
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum OperationStatus {
-    /// 未确认
-    Unconfirmed,
-    /// 已确认
-    Confirmed(u32), // 区块高度
+    pub timestamp: u64,
 }
 
 /// 心跳消息
@@ -186,26 +176,57 @@ struct Connection {
     state: ConnectionState,
 }
 
-/// 压缩设置
-#[derive(Debug, Clone, Copy)]
-pub enum CompressionLevel {
-    /// 不压缩
-    None,
-    /// 快速压缩
-    Fast,
-    /// 默认压缩
-    Default,
-    /// 最佳压缩
-    Best,
+/// WebSocket 配置结构体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    /// 最大连接数
+    pub max_connections: usize,
+    /// 心跳间隔
+    pub heartbeat_interval: u64,
+    /// 心跳超时
+    pub heartbeat_timeout: u64,
+    /// 连接清理间隔
+    pub cleanup_interval: u64,
+    /// 连接超时
+    pub connection_timeout: u64,
+    /// 压缩级别
+    pub compression_level: CompressionLevel,
+    /// 压缩阈值（字节）
+    pub compression_threshold: usize,
+    /// JWT 密钥
+    pub jwt_secret: String,
+    /// 每个连接的最大订阅数
+    pub max_subscriptions_per_connection: usize,
 }
 
-impl From<CompressionLevel> for Compression {
-    fn from(level: CompressionLevel) -> Self {
-        match level {
-            CompressionLevel::None => Compression::none(),
-            CompressionLevel::Fast => Compression::fast(),
-            CompressionLevel::Default => Compression::default(),
-            CompressionLevel::Best => Compression::best(),
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 1000,
+            heartbeat_interval: 30,
+            heartbeat_timeout: 60,
+            cleanup_interval: 300,
+            connection_timeout: 60,
+            compression_level: CompressionLevel::Default,
+            compression_threshold: 1024,
+            jwt_secret: "".to_string(),
+            max_subscriptions_per_connection: 100,
+        }
+    }
+}
+
+impl WebSocketConfig {
+    pub fn test_config() -> Self {
+        Self {
+            jwt_secret: "test_secret".to_string(),
+            max_connections: 100,
+            max_subscriptions_per_connection: 10,
+            connection_timeout: 60,
+            heartbeat_timeout: 60,
+            compression_level: CompressionLevel::Fast,
+            compression_threshold: 1024,
+            heartbeat_interval: 30,
+            cleanup_interval: 60,
         }
     }
 }
@@ -230,7 +251,7 @@ impl MessageHandler {
     /// 压缩消息
     fn compress(&self, data: &[u8]) -> Result<Bytes> {
         // 如果数据小于阈值或压缩级别为 None，则不压缩
-        if data.len() < self.compression_threshold || matches!(self.compression_level, CompressionLevel::None) {
+        if data.len() < self.compression_threshold {
             return Ok(Bytes::copy_from_slice(data));
         }
 
@@ -284,73 +305,76 @@ impl MessageHandler {
 
 /// WebSocket 服务器
 pub struct WsServer {
-    /// Atomicals 状态
-    state: Arc<AtomicalsState>,
-    /// 广播通道
-    broadcast_tx: broadcast::Sender<WsMessage>,
-    /// 最后一次 pong 时间
-    last_pong: std::sync::atomic::AtomicU64,
-    /// 连接数
-    connection_count: std::sync::atomic::AtomicUsize,
-    /// 配置
-    config: AppConfig,
     /// WebSocket 配置
     websocket_config: WebSocketConfig,
     /// 连接池
     connections: Arc<RwLock<HashMap<String, Connection>>>,
-    /// 关闭标志
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// JWT 密钥
-    jwt_key: String,
+    /// 当前连接数
+    connection_count: AtomicUsize,
+    /// Atomicals 状态
+    state: Arc<AtomicalsState>,
     /// 消息处理器
     message_handler: MessageHandler,
-    /// 监控系统
+    /// 指标收集器
     metrics: Arc<WebSocketMetrics>,
 }
 
 impl WsServer {
     /// 创建新的 WebSocket 服务器
-    pub fn new(state: Arc<AtomicalsState>, config: AppConfig) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(1024);
-        let message_handler = MessageHandler::new(
-            config.websocket_config.compression_level.unwrap_or(CompressionLevel::Default),
-            config.websocket_config.compression_threshold.unwrap_or(1024),
-        );
-
+    pub fn new(state: Arc<AtomicalsState>, config: WebSocketConfig) -> Self {
+        let config_clone = config.clone();
         Self {
-            state,
-            broadcast_tx,
-            last_pong: std::sync::atomic::AtomicU64::new(0),
-            connection_count: std::sync::atomic::AtomicUsize::new(0),
-            config,
-            websocket_config: config.websocket_config,
+            websocket_config: config,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            jwt_key: config.websocket_config.jwt_secret,
-            message_handler,
+            connection_count: AtomicUsize::new(0),
+            state,
+            message_handler: MessageHandler::new(
+                config_clone.compression_level,
+                config_clone.compression_threshold,
+            ),
             metrics: Arc::new(WebSocketMetrics::new()),
         }
     }
 
     /// 启动 WebSocket 服务器
-    pub async fn start(self: Arc<Self>, port: u16) -> Result<()> {
-        // 启动连接清理任务
-        let cleanup_server = self.clone();
+    pub async fn start_server(self: Arc<Self>) -> Result<()> {
+        // 启动心跳检查任务
+        let server = self.clone();
         tokio::spawn(async move {
-            cleanup_server.run_connection_cleanup().await;
+            let mut interval = tokio::time::interval(Duration::from_secs(server.websocket_config.heartbeat_interval));
+            loop {
+                interval.tick().await;
+                if let Err(e) = server.check_heartbeats().await {
+                    error!("Failed to check heartbeats: {}", e);
+                }
+            }
         });
 
-        // 创建路由
+        // 启动连接清理任务
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(server.websocket_config.cleanup_interval));
+            loop {
+                interval.tick().await;
+                if let Err(e) = server.cleanup_connections().await {
+                    error!("Failed to cleanup connections: {}", e);
+                }
+            }
+        });
+
+        // WebSocket 路由
         let ws_route = warp::path("ws")
             .and(warp::ws())
-            .and(warp::any().map(move || self.clone()))
-            .map(|ws: Ws, server: Arc<WsServer>| {
-                ws.on_upgrade(move |socket| server.handle_connection(socket, "127.0.0.1".to_string()))
+            .and(warp::addr::remote())
+            .map(move |ws: Ws, addr: Option<std::net::SocketAddr>| {
+                let server = self.clone();
+                let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
+                ws.on_upgrade(move |socket| server.handle_connection(socket, ip))
             });
 
         // 启动服务器
         warp::serve(ws_route)
-            .run(([127, 0, 0, 1], port))
+            .run(([127, 0, 0, 1], 3000))
             .await;
 
         Ok(())
@@ -362,7 +386,7 @@ impl WsServer {
         self.metrics.record_connection(&ip).await;
 
         // 检查是否达到最大连接数
-        let current_connections = self.connection_count.load(std::sync::atomic::Ordering::Relaxed);
+        let current_connections = self.connection_count.load(Ordering::Relaxed);
         if current_connections >= self.websocket_config.max_connections {
             let _ = ws.close().await;
             return;
@@ -372,7 +396,7 @@ impl WsServer {
         let connection_id = Uuid::new_v4().to_string();
 
         // 分离发送和接收端
-        let (ws_tx, mut ws_rx) = ws.split();
+        let (mut ws_tx, mut ws_rx) = ws.split();
         let (tx, rx) = futures::channel::mpsc::unbounded();
 
         // 创建连接对象，初始状态为未认证
@@ -389,21 +413,22 @@ impl WsServer {
             let mut connections = self.connections.write().await;
             connections.insert(connection_id.clone(), connection);
         }
-        self.connection_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.connection_count.fetch_add(1, Ordering::Relaxed);
 
         // 转发消息到 WebSocket
+        let server_clone = self.clone();
         let forward_task = tokio::spawn(async move {
             let mut rx = rx;
             while let Some(msg) = rx.next().await {
                 // 压缩发送的消息
-                if let Ok(compressed_msg) = self.message_handler.handle_outgoing(msg) {
+                if let Ok(compressed_msg) = server_clone.message_handler.handle_outgoing(msg) {
                     // 将 tungstenite::Message 转换为 warp::ws::Message
                     let warp_msg = match compressed_msg {
-                        tokio_tungstenite::tungstenite::Message::Text(text) => warp::ws::Message::text(text),
-                        tokio_tungstenite::tungstenite::Message::Binary(data) => warp::ws::Message::binary(data),
-                        tokio_tungstenite::tungstenite::Message::Ping(data) => warp::ws::Message::ping(data),
-                        tokio_tungstenite::tungstenite::Message::Pong(data) => warp::ws::Message::pong(data),
-                        tokio_tungstenite::tungstenite::Message::Close(_) => warp::ws::Message::close(),
+                        Message::Text(text) => WarpMessage::text(text),
+                        Message::Binary(data) => WarpMessage::binary(data),
+                        Message::Ping(data) => WarpMessage::ping(data),
+                        Message::Pong(data) => WarpMessage::pong(data),
+                        Message::Close(_) => WarpMessage::close(),
                         _ => continue,
                     };
                     if ws_tx.send(warp_msg).await.is_err() {
@@ -421,35 +446,23 @@ impl WsServer {
                     let start = Instant::now();
                     let compressed_size = if let Ok(text) = msg.to_str() {
                         text.len()
-                    } else if let Some(data) = msg.as_bytes() {
-                        data.len()
                     } else {
-                        0
+                        msg.as_bytes().len()
                     };
 
                     // 将 warp::ws::Message 转换为 tungstenite::Message
                     let tungstenite_msg = if let Ok(text) = msg.to_str() {
-                        tokio_tungstenite::tungstenite::Message::Text(text.to_string())
-                    } else if let Some(data) = msg.as_bytes() {
-                        tokio_tungstenite::tungstenite::Message::Binary(data.to_vec())
-                    } else if msg.is_ping() {
-                        tokio_tungstenite::tungstenite::Message::Ping(vec![])
-                    } else if msg.is_pong() {
-                        tokio_tungstenite::tungstenite::Message::Pong(vec![])
-                    } else if msg.is_close() {
-                        tokio_tungstenite::tungstenite::Message::Close(None)
+                        Message::Text(text.to_string())
                     } else {
-                        continue;
+                        Message::Binary(msg.as_bytes().to_vec())
                     };
 
                     // 解压接收的消息
                     if let Ok(decompressed_msg) = server.message_handler.handle_incoming(tungstenite_msg) {
-                        let original_size = if let Ok(text) = decompressed_msg.to_str() {
-                            text.len()
-                        } else if let Some(data) = decompressed_msg.as_bytes() {
-                            data.len()
-                        } else {
-                            0
+                        let original_size = match decompressed_msg {
+                            Message::Text(ref text) => text.len(),
+                            Message::Binary(ref data) => data.len(),
+                            _ => 0,
                         };
                         server.metrics.record_decompression(compressed_size, original_size);
                         server.metrics.record_message_received(original_size);
@@ -466,7 +479,7 @@ impl WsServer {
                         }
 
                         // 处理消息
-                        if let tokio_tungstenite::tungstenite::Message::Text(text) = decompressed_msg {
+                        if let Message::Text(text) = decompressed_msg {
                             let msg_start = Instant::now();
                             if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                                 match ws_msg {
@@ -593,49 +606,56 @@ impl WsServer {
     async fn remove_connection(&self, connection_id: &str) {
         let mut connections = self.connections.write().await;
         if connections.remove(connection_id).is_some() {
-            self.connection_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.connection_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
-    /// 运行连接清理任务
-    async fn run_connection_cleanup(self: Arc<Self>) {
-        let mut interval = time::interval(Duration::from_secs(60));
-        while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            interval.tick().await;
+    /// 检查心跳
+    async fn check_heartbeats(&self) -> Result<()> {
+        let mut to_remove = Vec::new();
+        let now = Instant::now();
 
-            let mut connections = self.connections.write().await;
-            let timeout = Duration::from_secs(self.websocket_config.connection_timeout);
-
-            // 找出超时的连接
-            let expired_connections: Vec<String> = connections
-                .iter()
-                .filter(|(_, conn)| conn.last_active.elapsed() > timeout)
-                .map(|(id, _)| id.clone())
-                .collect();
-
-            // 移除超时的连接
-            for id in expired_connections {
-                if let Some(conn) = connections.remove(&id) {
-                    self.connection_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    let _ = conn.tx.unbounded_send(Message::Close(None));
-                }
+        let connections = self.connections.read().await;
+        for (id, conn) in connections.iter() {
+            if now.duration_since(conn.last_active) > Duration::from_secs(self.websocket_config.heartbeat_timeout) {
+                to_remove.push(id.clone());
             }
         }
-    }
+        drop(connections);
 
-    /// 优雅关闭
-    pub async fn shutdown(&self) {
-        // 设置关闭标志
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // 关闭所有连接
-        let mut connections = self.connections.write().await;
-        for (_, conn) in connections.drain() {
-            let _ = conn.tx.unbounded_send(Message::Close(None));
+        for id in to_remove {
+            if let Some(conn) = self.connections.write().await.remove(&id) {
+                self.connection_count.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.record_disconnect();
+                info!("Connection {} timed out", id);
+            }
         }
 
-        // 等待一段时间让连接完成关闭
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    /// 清理连接
+    async fn cleanup_connections(&self) -> Result<()> {
+        let mut to_remove = Vec::new();
+        let now = Instant::now();
+
+        let connections = self.connections.read().await;
+        for (id, conn) in connections.iter() {
+            if now.duration_since(conn.last_active) > Duration::from_secs(self.websocket_config.connection_timeout) {
+                to_remove.push(id.clone());
+            }
+        }
+        drop(connections);
+
+        for id in to_remove {
+            if let Some(conn) = self.connections.write().await.remove(&id) {
+                self.connection_count.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.record_disconnect();
+                info!("Connection {} removed due to inactivity", id);
+            }
+        }
+
+        Ok(())
     }
 
     /// 处理订阅请求
@@ -645,7 +665,7 @@ impl WsServer {
         match req.subscription_type {
             SubscriptionType::Atomical(id) => {
                 // 验证 Atomical 是否存在
-                if !self.state.exists(&id)? {
+                if !self.state.exists(&id).await? {
                     return Err(anyhow!("Atomical not found"));
                 }
             }
@@ -659,7 +679,7 @@ impl WsServer {
 
     /// 验证 JWT 令牌
     fn verify_token(&self, token: &str) -> Result<Claims> {
-        let key = DecodingKey::from_secret(self.jwt_key.as_bytes());
+        let key = DecodingKey::from_secret(self.websocket_config.jwt_secret.as_bytes());
         let validation = Validation::default();
         
         let token_data = decode::<Claims>(token, &key, &validation)
@@ -676,7 +696,7 @@ impl WsServer {
     /// 更新最后一次 pong 时间
     fn update_last_pong(&self) {
         let now = chrono::Utc::now().timestamp();
-        self.last_pong.store(now as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_pong.store(now as u64, Ordering::Relaxed);
     }
 
     /// 广播消息
@@ -688,36 +708,6 @@ impl WsServer {
     /// 获取监控指标
     pub async fn get_metrics(&self) -> serde_json::Value {
         serde_json::to_value(self.metrics.get_metrics().await).unwrap()
-    }
-}
-
-/// WebSocket 配置结构体
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebSocketConfig {
-    /// 最大连接数
-    pub max_connections: usize,
-    /// 心跳超时时间 (秒)
-    pub heartbeat_timeout: u64,
-    /// 认证超时时间 (秒)
-    pub auth_timeout: u64,
-    /// 压缩等级
-    pub compression_level: CompressionLevel,
-    /// 压缩阈值 (字节)
-    pub compression_threshold: usize,
-    /// JWT 密钥
-    pub jwt_secret: String,
-}
-
-impl Default for WebSocketConfig {
-    fn default() -> Self {
-        Self {
-            max_connections: 1000,
-            heartbeat_timeout: 30,
-            auth_timeout: 10,
-            compression_level: CompressionLevel::Default,
-            compression_threshold: 1024,
-            jwt_secret: "".to_string(),
-        }
     }
 }
 
@@ -783,7 +773,6 @@ mod tests {
                 created_timestamp: 1234567890,
                 sealed: false,
             },
-            update_type: UpdateType::StateUpdate,
         }
     }
 
@@ -820,14 +809,14 @@ mod tests {
         // 测试服务器启动
         let server_clone = Arc::clone(&server);
         tokio::spawn(async move {
-            server_clone.start(8080).await.unwrap();
+            server_clone.start_server().await.unwrap();
         });
 
         // 等待服务器启动
         sleep(Duration::from_millis(100)).await;
 
         // 创建测试客户端
-        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:8080")
+        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:3000")
             .await
             .unwrap();
         let (mut write, mut read) = ws_stream.split();
@@ -864,7 +853,7 @@ mod tests {
     fn test_config() {
         let config = WebSocketConfig::default();
         assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.heartbeat_timeout, 30);
+        assert_eq!(config.heartbeat_interval, 30);
         assert_eq!(config.compression_threshold, 1024);
     }
 
@@ -936,7 +925,7 @@ mod tests {
             subscription_type: SubscriptionType::All,
         };
 
-        let sub_id = server.handle_subscribe(&req)?;
+        let sub_id = server.handle_subscribe(&req).await?;
         assert!(!sub_id.is_empty());
 
         // 测试超出最大订阅数
@@ -950,7 +939,7 @@ mod tests {
                 },
                 subscription_type: SubscriptionType::All,
             };
-            server.handle_subscribe(&req)?;
+            server.handle_subscribe(&req).await?;
         }
 
         let req = SubscribeRequest {
@@ -962,7 +951,7 @@ mod tests {
             },
             subscription_type: SubscriptionType::All,
         };
-        assert!(server.handle_subscribe(&req).is_err());
+        assert!(server.handle_subscribe(&req).await.is_err());
 
         Ok(())
     }

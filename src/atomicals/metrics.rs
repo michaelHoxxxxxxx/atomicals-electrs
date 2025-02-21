@@ -238,13 +238,13 @@ impl WebSocketMetrics {
     }
 
     /// 记录消息压缩
-    pub fn record_compression(&self, original_size: usize, compressed_size: usize) {
+    pub fn record_compression(&self, _original_size: usize, compressed_size: usize) {
         self.message.compressed.fetch_add(1, Ordering::Relaxed);
         self.message.bytes_compressed.fetch_add(compressed_size as u64, Ordering::Relaxed);
     }
 
     /// 记录消息解压
-    pub fn record_decompression(&self, compressed_size: usize, original_size: usize) {
+    pub fn record_decompression(&self, _compressed_size: usize, original_size: usize) {
         self.message.decompressed.fetch_add(1, Ordering::Relaxed);
         self.message.bytes_original.fetch_add(original_size as u64, Ordering::Relaxed);
     }

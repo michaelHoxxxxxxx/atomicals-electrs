@@ -1,40 +1,41 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
-use serde::{Serialize, Deserialize};
-use anyhow::Result;
 use bitcoin::{Transaction, TxOut, OutPoint, Address};
 use serde_json::Value;
-use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
-use super::websocket::{WsMessage, AtomicalUpdate, UpdateType, OperationNotification, OperationStatus};
+use anyhow::Result;
 
-#[derive(Debug, Clone)]
-pub struct AtomicalOutput {
-    pub txid: bitcoin::Txid,
-    pub vout: u32,
-    pub output: TxOut,
-    pub metadata: Value,
-    pub height: u32,
-    pub timestamp: u64,
-    pub atomical_type: AtomicalType,
-    pub sealed: bool,
-}
+use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
+use super::storage::AtomicalsStorage;
+use super::tx_parser::TxParser;
+use super::websocket::{WsMessage, AtomicalUpdate, OperationNotification, UpdateType, OperationStatus};
 
 #[derive(Debug)]
 pub struct AtomicalsState {
+    /// Atomical 输出映射
     outputs: RwLock<HashMap<AtomicalId, AtomicalOutput>>,
-    sealed: RwLock<HashMap<AtomicalId, bool>>,
+    /// Atomical 元数据映射
     metadata: RwLock<HashMap<AtomicalId, Value>>,
+    /// Atomical 封印状态映射
+    sealed: RwLock<HashMap<AtomicalId, bool>>,
+    /// 交易解析器
+    tx_parser: TxParser,
+    /// 存储
+    storage: Arc<AtomicalsStorage>,
+    /// WebSocket 广播通道
     broadcast_tx: broadcast::Sender<WsMessage>,
     network: bitcoin::Network,
 }
 
 impl AtomicalsState {
-    pub async fn new(network: bitcoin::Network) -> Result<Self> {
+    pub async fn new(network: bitcoin::Network, storage: Arc<AtomicalsStorage>, tx_parser: TxParser) -> Result<Self> {
         let (broadcast_tx, _) = broadcast::channel(1024);
         Ok(Self {
             outputs: RwLock::new(HashMap::new()),
-            sealed: RwLock::new(HashMap::new()),
             metadata: RwLock::new(HashMap::new()),
+            sealed: RwLock::new(HashMap::new()),
+            tx_parser,
+            storage,
             broadcast_tx,
             network,
         })
@@ -71,6 +72,10 @@ impl AtomicalsState {
             created_timestamp: output.timestamp,
             sealed: is_sealed,
         })
+    }
+
+    pub async fn exists(&self, id: &AtomicalId) -> Result<bool> {
+        Ok(self.outputs.read().await.contains_key(id))
     }
 
     pub async fn apply_operations(&mut self, operations: Vec<AtomicalOperation>, tx: &Transaction, height: u32, timestamp: u64) -> Result<()> {
@@ -131,6 +136,18 @@ impl AtomicalsState {
 
         self.notify_operation(&operations_clone, tx.compute_txid().to_string(), Some(height)).await?;
         Ok(())
+    }
+
+    /// 获取交易中的 Atomical 操作
+    pub async fn get_atomical_operations(&self, tx: &Transaction) -> Result<Vec<AtomicalOperation>> {
+        let mut operations = Vec::new();
+        
+        // 解析交易中的操作
+        if let Some(op) = self.tx_parser.parse_atomical_operation(tx).await? {
+            operations.push(op);
+        }
+        
+        Ok(operations)
     }
 
     pub fn broadcast_tx(&self) -> broadcast::Sender<WsMessage> {
@@ -246,7 +263,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_creation() -> Result<()> {
-        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         assert!(state.outputs.read().await.is_empty());
         assert!(state.sealed.read().await.is_empty());
         assert!(state.metadata.read().await.is_empty());
@@ -255,7 +274,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_atomical_existence() -> Result<()> {
-        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试不存在的 Atomical
@@ -284,7 +305,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_seal_operations() -> Result<()> {
-        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试未封印状态
@@ -300,7 +323,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_management() -> Result<()> {
-        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试获取不存在的输出
@@ -335,7 +360,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_metadata_management() -> Result<()> {
-        let state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
 
         // 测试获取不存在的元数据
@@ -374,7 +401,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_operation_application() -> Result<()> {
-        let mut state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let mut state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let tx = create_test_transaction();
         let height = 100;
         let timestamp = 1234567890;
@@ -440,7 +469,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_notifications() -> Result<()> {
-        let mut state = AtomicalsState::new(bitcoin::Network::Testnet).await?;
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let mut state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
         let tx = create_test_transaction();
 
@@ -483,7 +514,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_operations() -> Result<()> {
-        let state = Arc::new(AtomicalsState::new(bitcoin::Network::Testnet).await?);
+        let storage = Arc::new(AtomicalsStorage::new());
+        let tx_parser = TxParser::new();
+        let state = AtomicalsState::new(bitcoin::Network::Testnet, storage, tx_parser).await?;
         let atomical_id = create_test_atomical_id();
         let tx = create_test_transaction();
 
