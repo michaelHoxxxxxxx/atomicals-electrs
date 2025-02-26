@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use bitcoin::{Address, Network, Transaction, Txid};
@@ -91,6 +92,8 @@ impl AtomicalsRpc {
     pub fn get_atomicals_by_address(&self, address: &str) -> Result<Vec<AtomicalInfo>> {
         // 解析地址
         let addr = Address::from_str(address).map_err(|_| anyhow!("Invalid address"))?;
+        // 需要为地址指定网络类型
+        let addr = addr.require_network(self.network).map_err(|_| anyhow!("Invalid network for address"))?;
         let script = addr.script_pubkey();
 
         // 查询地址拥有的 Atomicals
@@ -129,12 +132,22 @@ impl AtomicalsRpc {
     }
 
     /// 获取 Atomicals 统计信息
-    pub fn get_stats(&self) -> Result<Value> {
+    pub async fn get_stats(&self) -> Result<Value> {
         Ok(serde_json::json!({
-            "total_atomicals": self.state.get_total_count()?,
-            "total_nft": self.state.get_nft_count()?,
-            "total_ft": self.state.get_ft_count()?,
-            "total_sealed": self.state.get_sealed_count()?,
+            "total_atomicals": self.state.get_total_count().await?,
+            "total_nft": self.state.get_nft_count().await?,
+            "total_ft": self.state.get_ft_count().await?,
+            "total_sealed": self.state.get_sealed_count().await?,
+        }))
+    }
+
+    /// 获取 Atomicals 统计信息（同步版本）
+    pub fn get_stats_sync(&self) -> Result<Value> {
+        Ok(serde_json::json!({
+            "total_atomicals": self.state.get_total_count_sync()?,
+            "total_nft": self.state.get_nft_count_sync()?,
+            "total_ft": self.state.get_ft_count_sync()?,
+            "total_sealed": self.state.get_sealed_count_sync()?,
         }))
     }
 }
@@ -415,7 +428,7 @@ mod tests {
         rpc.state.seal_atomical(&id1)?;
 
         // 测试统计信息
-        let stats = rpc.get_stats()?;
+        let stats = rpc.get_stats_sync()?;
         assert_eq!(stats["total_atomicals"], 2);
         assert_eq!(stats["total_nft"], 1);
         assert_eq!(stats["total_ft"], 1);

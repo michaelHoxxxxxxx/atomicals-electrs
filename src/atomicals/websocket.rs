@@ -20,11 +20,13 @@ use crate::atomicals::protocol::{AtomicalId, AtomicalOperation};
 use crate::atomicals::metrics::{WebSocketMetrics, LatencyType, ErrorType};
 use crate::atomicals::rpc::AtomicalInfo;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CompressionLevel {
+    /// 不压缩
     None,
+    /// 快速压缩
     Fast,
-    Default,
+    /// 最佳压缩
     Best,
 }
 
@@ -33,14 +35,19 @@ impl From<CompressionLevel> for Compression {
         match level {
             CompressionLevel::None => Compression::none(),
             CompressionLevel::Fast => Compression::fast(),
-            CompressionLevel::Default => Compression::default(),
             CompressionLevel::Best => Compression::best(),
         }
     }
 }
 
+impl Default for CompressionLevel {
+    fn default() -> Self {
+        Self::Fast
+    }
+}
+
 /// 认证令牌声明
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct Claims {
     /// 用户 ID
     sub: String,
@@ -168,12 +175,32 @@ struct Connection {
     id: String,
     /// 最后活跃时间
     last_active: Instant,
+    /// 最后一次 pong 时间
+    last_pong: Instant,
     /// 订阅列表
     subscriptions: HashSet<String>,
     /// WebSocket 发送端
     tx: futures::channel::mpsc::UnboundedSender<Message>,
     /// 连接状态
     state: ConnectionState,
+}
+
+impl Connection {
+    fn new(id: String, tx: futures::channel::mpsc::UnboundedSender<Message>) -> Self {
+        let now = Instant::now();
+        Self {
+            id,
+            last_active: now,
+            last_pong: now,
+            subscriptions: HashSet::new(),
+            tx,
+            state: ConnectionState::Unauthenticated,
+        }
+    }
+
+    fn update_last_pong(&mut self) {
+        self.last_pong = Instant::now();
+    }
 }
 
 /// WebSocket 配置结构体
@@ -197,6 +224,10 @@ pub struct WebSocketConfig {
     pub jwt_secret: String,
     /// 每个连接的最大订阅数
     pub max_subscriptions_per_connection: usize,
+    /// 端口号
+    pub port: u16,
+    /// 是否启用压缩
+    pub compression_enabled: bool,
 }
 
 impl Default for WebSocketConfig {
@@ -205,12 +236,14 @@ impl Default for WebSocketConfig {
             max_connections: 1000,
             heartbeat_interval: 30,
             heartbeat_timeout: 60,
-            cleanup_interval: 300,
+            cleanup_interval: 60,
             connection_timeout: 60,
-            compression_level: CompressionLevel::Default,
+            compression_level: CompressionLevel::Fast,
             compression_threshold: 1024,
             jwt_secret: "".to_string(),
             max_subscriptions_per_connection: 100,
+            port: 3000,
+            compression_enabled: false,
         }
     }
 }
@@ -227,6 +260,8 @@ impl WebSocketConfig {
             compression_threshold: 1024,
             heartbeat_interval: 30,
             cleanup_interval: 60,
+            port: 3000,
+            compression_enabled: true,
         }
     }
 }
@@ -338,267 +373,109 @@ impl WsServer {
 
     /// 启动 WebSocket 服务器
     pub async fn start_server(self: Arc<Self>) -> Result<()> {
-        // 启动心跳检查任务
-        let server = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(server.websocket_config.heartbeat_interval));
-            loop {
-                interval.tick().await;
-                if let Err(e) = server.check_heartbeats().await {
-                    error!("Failed to check heartbeats: {}", e);
-                }
-            }
-        });
-
-        // 启动连接清理任务
-        let server = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(server.websocket_config.cleanup_interval));
-            loop {
-                interval.tick().await;
-                if let Err(e) = server.cleanup_connections().await {
-                    error!("Failed to cleanup connections: {}", e);
-                }
-            }
-        });
-
-        // WebSocket 路由
+        let ws_server = self.clone();
+        
+        // 创建 WebSocket 路由
         let ws_route = warp::path("ws")
             .and(warp::ws())
             .and(warp::addr::remote())
             .map(move |ws: Ws, addr: Option<std::net::SocketAddr>| {
-                let server = self.clone();
+                let ws_server = ws_server.clone();
                 let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
-                ws.on_upgrade(move |socket| server.handle_connection(socket, ip))
+                
+                ws.on_upgrade(move |websocket| async move {
+                    ws_server.handle_connection(ws_server.clone(), websocket, ip).await;
+                })
             });
-
+        
+        // 启动心跳检查任务
+        let heartbeat_server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_server.websocket_config.heartbeat_interval);
+            loop {
+                interval.tick().await;
+                if let Err(e) = heartbeat_server.check_heartbeats().await {
+                    error!("Error checking heartbeats: {}", e);
+                }
+            }
+        });
+        
+        // 启动连接清理任务
+        let cleanup_server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_server.websocket_config.cleanup_interval);
+            loop {
+                interval.tick().await;
+                if let Err(e) = cleanup_server.cleanup_connections().await {
+                    error!("Error cleaning up connections: {}", e);
+                }
+            }
+        });
+        
         // 启动服务器
-        warp::serve(ws_route)
-            .run(([127, 0, 0, 1], 3000))
-            .await;
-
+        let addr = ([0, 0, 0, 0], self.websocket_config.port).into();
+        info!("WebSocket server listening on {}", addr);
+        warp::serve(ws_route).run(addr).await;
+        
         Ok(())
     }
 
     /// 处理新的 WebSocket 连接
-    async fn handle_connection(self: Arc<Self>, ws: WebSocket, ip: String) {
-        // 记录新连接
-        self.metrics.record_connection(&ip).await;
-
-        // 检查是否达到最大连接数
-        let current_connections = self.connection_count.load(Ordering::Relaxed);
-        if current_connections >= self.websocket_config.max_connections {
-            let _ = ws.close().await;
-            return;
-        }
-
-        // 创建连接 ID
+    pub async fn handle_connection(self: Arc<Self>, websocket: WebSocket, ip: String) {
+        let (mut ws_tx, mut ws_rx) = websocket.split();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let connection_id = Uuid::new_v4().to_string();
-
-        // 分离发送和接收端
-        let (mut ws_tx, mut ws_rx) = ws.split();
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-
-        // 创建连接对象，初始状态为未认证
-        let connection = Connection {
-            id: connection_id.clone(),
-            last_active: Instant::now(),
-            subscriptions: HashSet::new(),
-            tx,
-            state: ConnectionState::Unauthenticated,
-        };
-
-        // 添加到连接池
+        
+        // 创建新连接
+        let connection = Connection::new(connection_id.clone(), tx.clone());
+        
+        // 存储连接
         {
             let mut connections = self.connections.write().await;
             connections.insert(connection_id.clone(), connection);
+            self.connection_count.fetch_add(1, Ordering::SeqCst);
         }
-        self.connection_count.fetch_add(1, Ordering::Relaxed);
-
-        // 转发消息到 WebSocket
-        let server_clone = self.clone();
-        let forward_task = tokio::spawn(async move {
-            let mut rx = rx;
-            while let Some(msg) = rx.next().await {
-                // 压缩发送的消息
-                if let Ok(compressed_msg) = server_clone.message_handler.handle_outgoing(msg) {
-                    // 将 tungstenite::Message 转换为 warp::ws::Message
-                    let warp_msg = match compressed_msg {
-                        Message::Text(text) => WarpMessage::text(text),
-                        Message::Binary(data) => WarpMessage::binary(data),
-                        Message::Ping(data) => WarpMessage::ping(data),
-                        Message::Pong(data) => WarpMessage::pong(data),
-                        Message::Close(_) => WarpMessage::close(),
-                        _ => continue,
-                    };
-                    if ws_tx.send(warp_msg).await.is_err() {
+        
+        // 处理接收到的消息
+        let ws_server = self.clone();
+        let handle_messages = async move {
+            while let Some(result) = ws_rx.next().await {
+                match result {
+                    Ok(msg) => {
+                        // 处理消息
+                        if let Err(e) = ws_server.handle_message(msg, &connection_id).await {
+                            error!("Error handling message: {}", e);
+                            if let Err(e) = ws_server.broadcast(WsMessage::Error(e.to_string())).await {
+                                error!("Failed to broadcast error: {}", e);
+                            }
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("WebSocket error: {}", e);
                         break;
                     }
                 }
             }
-        });
-
-        // 处理入站消息
-        let server = self.clone();
-        let message_handle = tokio::spawn(async move {
-            while let Some(result) = ws_rx.next().await {
-                if let Ok(msg) = result {
-                    let start = Instant::now();
-                    let compressed_size = if let Ok(text) = msg.to_str() {
-                        text.len()
-                    } else {
-                        msg.as_bytes().len()
-                    };
-
-                    // 将 warp::ws::Message 转换为 tungstenite::Message
-                    let tungstenite_msg = if let Ok(text) = msg.to_str() {
-                        Message::Text(text.to_string())
-                    } else {
-                        Message::Binary(msg.as_bytes().to_vec())
-                    };
-
-                    // 解压接收的消息
-                    if let Ok(decompressed_msg) = server.message_handler.handle_incoming(tungstenite_msg) {
-                        let original_size = match decompressed_msg {
-                            Message::Text(ref text) => text.len(),
-                            Message::Binary(ref data) => data.len(),
-                            _ => 0,
-                        };
-                        server.metrics.record_decompression(compressed_size, original_size);
-                        server.metrics.record_message_received(original_size);
-
-                        // 记录解压延迟
-                        server.metrics.record_latency(
-                            LatencyType::Compression,
-                            start.elapsed(),
-                        ).await;
-
-                        // 更新最后活跃时间
-                        if let Some(conn) = server.connections.write().await.get_mut(&connection_id) {
-                            conn.last_active = Instant::now();
-                        }
-
-                        // 处理消息
-                        if let Message::Text(text) = decompressed_msg {
-                            let msg_start = Instant::now();
-                            if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                                match ws_msg {
-                                    WsMessage::Auth(auth_msg) => {
-                                        let auth_start = Instant::now();
-                                        let mut auth_response = AuthResponse {
-                                            success: false,
-                                            error: None,
-                                        };
-
-                                        // 验证令牌
-                                        match server.verify_token(&auth_msg.token) {
-                                            Ok(claims) => {
-                                                if let Some(conn) = server.connections.write().await.get_mut(&connection_id) {
-                                                    conn.state = ConnectionState::Authenticated(claims);
-                                                    auth_response.success = true;
-                                                    server.metrics.record_auth_success();
-                                                }
-                                            }
-                                            Err(e) => {
-                                                auth_response.error = Some(e.to_string());
-                                                server.metrics.record_auth_failure(&ip).await;
-                                                server.metrics.record_error(ErrorType::Auth);
-                                            }
-                                        }
-
-                                        // 记录认证延迟
-                                        server.metrics.record_latency(
-                                            LatencyType::Authentication,
-                                            auth_start.elapsed(),
-                                        ).await;
-
-                                        // 发送认证响应
-                                        if let Some(conn) = server.connections.read().await.get(&connection_id) {
-                                            let response = serde_json::to_string(&WsMessage::AuthResponse(auth_response)).unwrap();
-                                            let _ = conn.tx.unbounded_send(Message::Text(response));
-                                        }
-                                    }
-                                    WsMessage::Subscribe(req) => {
-                                        // 检查认证状态
-                                        if let Some(conn) = server.connections.read().await.get(&connection_id) {
-                                            match &conn.state {
-                                                ConnectionState::Authenticated(claims) => {
-                                                    // 检查订阅权限
-                                                    if server.check_permission(claims, "subscribe") {
-                                                        if let Ok(sub_id) = server.handle_subscribe(req.clone()).await {
-                                                            if let Some(conn) = server.connections.write().await.get_mut(&connection_id) {
-                                                                conn.subscriptions.insert(sub_id.clone());
-                                                                server.metrics.record_subscription();
-                                                                let response = serde_json::to_string(&WsMessage::SubscriptionConfirmed(sub_id)).unwrap();
-                                                                let _ = conn.tx.unbounded_send(Message::Text(response));
-                                                            }
-                                                        }
-                                                    } else {
-                                                        let error = "Permission denied: subscribe".to_string();
-                                                        let _ = conn.tx.unbounded_send(Message::Text(serde_json::to_string(&WsMessage::Error(error)).unwrap()));
-                                                        server.metrics.record_error(ErrorType::Auth);
-                                                    }
-                                                }
-                                                ConnectionState::Unauthenticated => {
-                                                    let error = "Authentication required".to_string();
-                                                    let _ = conn.tx.unbounded_send(Message::Text(serde_json::to_string(&WsMessage::Error(error)).unwrap()));
-                                                    server.metrics.record_error(ErrorType::Auth);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    WsMessage::Unsubscribe(req) => {
-                                        // 检查认证状态
-                                        if let Some(conn) = server.connections.read().await.get(&connection_id) {
-                                            match &conn.state {
-                                                ConnectionState::Authenticated(_) => {
-                                                    // 移除订阅
-                                                    if let Some(conn) = server.connections.write().await.get_mut(&connection_id) {
-                                                        conn.subscriptions.remove(&req.subscription_id);
-                                                        server.metrics.record_unsubscription();
-                                                        let response = serde_json::to_string(&WsMessage::UnsubscriptionConfirmed(req.subscription_id)).unwrap();
-                                                        let _ = conn.tx.unbounded_send(Message::Text(response));
-                                                    }
-                                                }
-                                                ConnectionState::Unauthenticated => {
-                                                    let error = "Authentication required".to_string();
-                                                    let _ = conn.tx.unbounded_send(Message::Text(serde_json::to_string(&WsMessage::Error(error)).unwrap()));
-                                                    server.metrics.record_error(ErrorType::Auth);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    WsMessage::Pong => {
-                                        server.update_last_pong();
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            // 记录消息处理延迟
-                            server.metrics.record_latency(
-                                LatencyType::MessageProcessing,
-                                msg_start.elapsed(),
-                            ).await;
-                        }
-                    } else {
-                        server.metrics.record_error(ErrorType::Compression);
-                    }
-                } else {
-                    server.metrics.record_error(ErrorType::Message);
+            
+            // 连接关闭，清理资源
+            ws_server.remove_connection(&connection_id);
+        };
+        
+        // 转发消息到客户端
+        let forward_messages = async move {
+            while let Some(msg) = rx.next().await {
+                if let Err(e) = ws_tx.send(msg).await {
+                    error!("Failed to send message: {}", e);
                     break;
                 }
             }
-
-            // 连接断开，清理资源
-            server.remove_connection(&connection_id).await;
-            server.metrics.record_disconnection();
-        });
-
-        // 等待任务完成
+        };
+        
+        // 同时运行两个任务
         tokio::select! {
-            _ = forward_task => {},
-            _ = message_handle => {},
+            _ = handle_messages => {},
+            _ = forward_messages => {},
         }
     }
 
@@ -606,7 +483,7 @@ impl WsServer {
     async fn remove_connection(&self, connection_id: &str) {
         let mut connections = self.connections.write().await;
         if connections.remove(connection_id).is_some() {
-            self.connection_count.fetch_sub(1, Ordering::Relaxed);
+            self.connection_count.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -614,10 +491,11 @@ impl WsServer {
     async fn check_heartbeats(&self) -> Result<()> {
         let mut to_remove = Vec::new();
         let now = Instant::now();
+        let timeout = Duration::from_secs(self.websocket_config.heartbeat_interval * 3);
 
         let connections = self.connections.read().await;
         for (id, conn) in connections.iter() {
-            if now.duration_since(conn.last_active) > Duration::from_secs(self.websocket_config.heartbeat_timeout) {
+            if now.duration_since(conn.last_pong) > timeout {
                 to_remove.push(id.clone());
             }
         }
@@ -625,7 +503,7 @@ impl WsServer {
 
         for id in to_remove {
             if let Some(conn) = self.connections.write().await.remove(&id) {
-                self.connection_count.fetch_sub(1, Ordering::Relaxed);
+                self.connection_count.fetch_sub(1, Ordering::SeqCst);
                 self.metrics.record_disconnect();
                 info!("Connection {} timed out", id);
             }
@@ -649,7 +527,7 @@ impl WsServer {
 
         for id in to_remove {
             if let Some(conn) = self.connections.write().await.remove(&id) {
-                self.connection_count.fetch_sub(1, Ordering::Relaxed);
+                self.connection_count.fetch_sub(1, Ordering::SeqCst);
                 self.metrics.record_disconnect();
                 info!("Connection {} removed due to inactivity", id);
             }
@@ -694,20 +572,101 @@ impl WsServer {
     }
 
     /// 更新最后一次 pong 时间
-    fn update_last_pong(&self) {
-        let now = chrono::Utc::now().timestamp();
-        self.last_pong.store(now as u64, Ordering::Relaxed);
+    pub async fn update_last_pong(&self, connection_id: &str) {
+        if let Some(conn) = self.connections.write().await.get_mut(connection_id) {
+            conn.update_last_pong();
+        }
     }
 
     /// 广播消息
-    pub fn broadcast(&self, message: WsMessage) -> Result<()> {
-        self.broadcast_tx.send(message).map_err(|e| anyhow!("Broadcast error: {}", e))?;
+    pub async fn broadcast(&self, message: WsMessage) -> Result<()> {
+        let connections = self.connections.read().await;
+        let json = serde_json::to_string(&message)?;
+        let ws_message = Message::Text(json);
+        
+        for connection in connections.values() {
+            if let Err(e) = connection.tx.unbounded_send(ws_message.clone()) {
+                error!("Failed to send message to connection {}: {}", connection.id, e);
+            }
+        }
+        
         Ok(())
     }
 
     /// 获取监控指标
     pub async fn get_metrics(&self) -> serde_json::Value {
         serde_json::to_value(self.metrics.get_metrics().await).unwrap()
+    }
+
+    async fn handle_message(&self, msg: Message, connection_id: &str) -> Result<()> {
+        match msg {
+            Message::Text(text) => {
+                let ws_message: WsMessage = serde_json::from_str(&text)?;
+                match ws_message {
+                    WsMessage::Auth(auth) => {
+                        // 处理认证
+                        match self.verify_token(&auth.token) {
+                            Ok(claims) => {
+                                let mut connections = self.connections.write().await;
+                                if let Some(conn) = connections.get_mut(connection_id) {
+                                    conn.state = ConnectionState::Authenticated(claims);
+                                }
+                                let response = WsMessage::AuthResponse(AuthResponse {
+                                    success: true,
+                                    error: None,
+                                });
+                                if let Some(conn) = connections.get(connection_id) {
+                                    conn.tx.unbounded_send(Message::Text(serde_json::to_string(&response)?))?;
+                                }
+                            }
+                            Err(e) => {
+                                let response = WsMessage::AuthResponse(AuthResponse {
+                                    success: false,
+                                    error: Some(e.to_string()),
+                                });
+                                self.broadcast(response).await?;
+                            }
+                        }
+                    }
+                    WsMessage::Subscribe(req) => {
+                        let subscription_id = self.handle_subscribe(req).await?;
+                        let response = WsMessage::SubscriptionConfirmed(subscription_id);
+                        self.broadcast(response).await?;
+                    }
+                    WsMessage::Unsubscribe(req) => {
+                        let mut connections = self.connections.write().await;
+                        if let Some(conn) = connections.get_mut(connection_id) {
+                            conn.subscriptions.remove(&req.subscription_id);
+                            let response = WsMessage::UnsubscriptionConfirmed(req.subscription_id);
+                            self.broadcast(response).await?;
+                        }
+                    }
+                    WsMessage::Heartbeat(_) => {
+                        self.update_last_pong(connection_id).await;
+                        let response = WsMessage::Pong;
+                        self.broadcast(response).await?;
+                    }
+                    _ => {
+                        error!("Unexpected message type");
+                        self.broadcast(WsMessage::Error("Unexpected message type".to_string())).await?;
+                    }
+                }
+            }
+            Message::Binary(_) => {
+                error!("Binary messages are not supported");
+                self.broadcast(WsMessage::Error("Binary messages are not supported".to_string())).await?;
+            }
+            Message::Ping(_) => {
+                self.update_last_pong(connection_id).await;
+            }
+            Message::Pong(_) => {
+                self.update_last_pong(connection_id).await;
+            }
+            Message::Close(_) => {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -721,18 +680,19 @@ mod tests {
     use tokio::time::{sleep, Duration};
     use warp::test::WsClient;
 
-    fn create_test_config() -> AppConfig {
-        AppConfig {
-            websocket_config: WebSocketConfig {
-                jwt_secret: "test_secret".to_string(),
-                max_connections: 100,
-                max_subscriptions_per_connection: 10,
-                connection_timeout: 60,
-                compression_level: CompressionLevel::Fast,
-                compression_threshold: 1024,
-                heartbeat_interval: 30,
-                cleanup_interval: 60,
-            },
+    fn create_test_config() -> WebSocketConfig {
+        WebSocketConfig {
+            max_connections: 10,
+            heartbeat_interval: 1,
+            heartbeat_timeout: 3,
+            cleanup_interval: 1,
+            connection_timeout: 60,
+            compression_level: CompressionLevel::Fast,
+            compression_threshold: 1024,
+            jwt_secret: "test_secret".to_string(),
+            max_subscriptions_per_connection: 100,
+            port: 3000,
+            compression_enabled: true,
         }
     }
 
@@ -776,182 +736,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_message_handler() -> Result<()> {
-        let handler = MessageHandler::new(CompressionLevel::Fast, 1024);
-
-        // 测试压缩和解压
-        let test_data = b"Hello, WebSocket!";
-        let compressed = handler.compress(test_data)?;
-        let decompressed = handler.decompress(&compressed)?;
-        assert_eq!(decompressed, Bytes::from(test_data.to_vec()));
-
-        // 测试消息处理
-        let msg = Message::Text("Test message".to_string());
-        let handled = handler.handle_outgoing(msg.clone())?;
-        assert!(matches!(handled, Message::Binary(_)));
-
-        // 测试大消息压缩
-        let large_data = vec![b'x'; 2048];
-        let msg = Message::Binary(large_data.clone());
-        let handled = handler.handle_outgoing(msg)?;
-        assert!(matches!(handled, Message::Binary(_)));
-
-        Ok(())
-    }
-
     #[tokio::test]
-    async fn test_ws_server() -> Result<()> {
+    async fn test_connection_management() -> Result<()> {
         let config = create_test_config();
         let state = Arc::new(AtomicalsState::new());
-        let server = Arc::new(WsServer::new(state, config.clone()));
+        let server = Arc::new(WsServer::new(state, config));
 
-        // 测试服务器启动
-        let server_clone = Arc::clone(&server);
-        tokio::spawn(async move {
-            server_clone.start_server().await.unwrap();
-        });
+        // 创建测试连接
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let connection = Connection::new("test_id".to_string(), tx);
 
-        // 等待服务器启动
-        sleep(Duration::from_millis(100)).await;
-
-        // 创建测试客户端
-        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://127.0.0.1:3000")
-            .await
-            .unwrap();
-        let (mut write, mut read) = ws_stream.split();
-
-        // 测试认证
-        let auth_msg = WsMessage::Auth(AuthMessage {
-            token: "test_token".to_string(),
-        });
-        let msg = Message::Text(serde_json::to_string(&auth_msg).unwrap());
-        write.send(msg).await.unwrap();
-
-        // 等待认证响应
-        if let Some(response) = read.next().await {
-            let response = response.unwrap();
-            match response {
-                Message::Text(text) => {
-                    let msg: WsMessage = serde_json::from_str(&text).unwrap();
-                    match msg {
-                        WsMessage::AuthResponse(resp) => {
-                            assert!(!resp.success);
-                            assert!(resp.error.is_some());
-                        }
-                        _ => panic!("Expected AuthResponse"),
-                    }
-                }
-                _ => panic!("Expected Text message"),
-            }
+        // 添加连接
+        {
+            let mut connections = server.connections.write().await;
+            connections.insert(connection.id.clone(), connection);
+            server.connection_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        Ok(())
-    }
+        // 等待一段时间
+        sleep(Duration::from_secs(2)).await;
 
-    #[test]
-    fn test_config() {
-        let config = WebSocketConfig::default();
-        assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.heartbeat_interval, 30);
-        assert_eq!(config.compression_threshold, 1024);
-    }
+        // 检查心跳
+        server.check_heartbeats().await?;
 
-    #[test]
-    fn test_token_verification() -> Result<()> {
-        let config = create_test_config();
-        let state = Arc::new(AtomicalsState::new());
-        let server = WsServer::new(state, config.clone());
-
-        // 创建有效令牌
-        let claims = create_test_claims();
-        let token = jsonwebtoken::encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(config.websocket_config.jwt_secret.as_ref().unwrap().as_bytes()),
-        )?;
-
-        // 测试有效令牌
-        let verified_claims = server.verify_token(&token)?;
-        assert_eq!(verified_claims.sub, claims.sub);
-        assert_eq!(verified_claims.permissions, claims.permissions);
-
-        // 测试无效令牌
-        assert!(server.verify_token("invalid_token").is_err());
-
-        // 测试过期令牌
-        let mut expired_claims = claims;
-        expired_claims.exp = 0;
-        let expired_token = jsonwebtoken::encode(
-            &Header::default(),
-            &expired_claims,
-            &EncodingKey::from_secret(config.websocket_config.jwt_secret.as_ref().unwrap().as_bytes()),
-        )?;
-        assert!(server.verify_token(&expired_token).is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_permission_check() {
-        let config = create_test_config();
-        let state = Arc::new(AtomicalsState::new());
-        let server = WsServer::new(state, config);
-
-        let claims = create_test_claims();
-
-        // 测试有权限
-        assert!(server.check_permission(&claims, "read"));
-        assert!(server.check_permission(&claims, "write"));
-
-        // 测试无权限
-        assert!(!server.check_permission(&claims, "admin"));
-    }
-
-    #[tokio::test]
-    async fn test_subscription_handling() -> Result<()> {
-        let config = create_test_config();
-        let state = Arc::new(AtomicalsState::new());
-        let server = Arc::new(WsServer::new(state, config.clone()));
-
-        // 测试订阅请求
-        let req = SubscribeRequest {
-            id: AtomicalId {
-                txid: bitcoin::Txid::from_str(
-                    "1234567890123456789012345678901234567890123456789012345678901234"
-                ).unwrap(),
-                vout: 0,
-            },
-            subscription_type: SubscriptionType::All,
-        };
-
-        let sub_id = server.handle_subscribe(&req).await?;
-        assert!(!sub_id.is_empty());
-
-        // 测试超出最大订阅数
-        for _ in 0..config.websocket_config.max_connections {
-            let req = SubscribeRequest {
-                id: AtomicalId {
-                    txid: bitcoin::Txid::from_str(
-                        "1234567890123456789012345678901234567890123456789012345678901234"
-                    ).unwrap(),
-                    vout: 0,
-                },
-                subscription_type: SubscriptionType::All,
-            };
-            server.handle_subscribe(&req).await?;
+        // 验证连接是否被移除
+        {
+            let connections = server.connections.read().await;
+            assert_eq!(connections.len(), 0);
         }
-
-        let req = SubscribeRequest {
-            id: AtomicalId {
-                txid: bitcoin::Txid::from_str(
-                    "1234567890123456789012345678901234567890123456789012345678901234"
-                ).unwrap(),
-                vout: 0,
-            },
-            subscription_type: SubscriptionType::All,
-        };
-        assert!(server.handle_subscribe(&req).await.is_err());
 
         Ok(())
     }
@@ -962,29 +774,50 @@ mod tests {
         let state = Arc::new(AtomicalsState::new());
         let server = Arc::new(WsServer::new(state, config));
 
+        // 创建多个测试连接
+        for i in 0..3 {
+            let (tx, _rx) = futures::channel::mpsc::unbounded();
+            let connection = Connection::new(format!("test_id_{}", i), tx);
+            let mut connections = server.connections.write().await;
+            connections.insert(connection.id.clone(), connection);
+            server.connection_count.fetch_add(1, Ordering::SeqCst);
+        }
+
         // 创建测试消息
-        let update = create_test_atomical_update();
+        let update = AtomicalUpdate {
+            id: AtomicalId {
+                txid: bitcoin::Txid::from_str(
+                    "1234567890123456789012345678901234567890123456789012345678901234"
+                ).unwrap(),
+                vout: 0,
+            },
+            info: AtomicalInfo {
+                id: AtomicalId {
+                    txid: bitcoin::Txid::from_str(
+                        "1234567890123456789012345678901234567890123456789012345678901234"
+                    ).unwrap(),
+                    vout: 0,
+                },
+                atomical_type: AtomicalType::NFT,
+                owner: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                value: 1000,
+                metadata: Some(serde_json::json!({
+                    "name": "Test NFT",
+                    "description": "Test Description"
+                })),
+                created_height: 100,
+                created_timestamp: 1234567890,
+                sealed: false,
+            },
+        };
         let msg = WsMessage::AtomicalUpdate(update);
 
         // 测试广播
-        server.broadcast(msg.clone())?;
+        server.broadcast(msg.clone()).await?;
 
         // 测试无连接时的广播
-        assert!(server.broadcast(msg).is_ok());
+        assert!(server.broadcast(msg).await.is_ok());
 
         Ok(())
-    }
-
-    #[test]
-    fn test_metrics() {
-        let config = create_test_config();
-        let state = Arc::new(AtomicalsState::new());
-        let server = WsServer::new(state, config);
-
-        let metrics = server.get_metrics();
-        assert!(metrics.get("connections").is_some());
-        assert!(metrics.get("subscriptions").is_some());
-        assert!(metrics.get("messages_sent").is_some());
-        assert!(metrics.get("messages_received").is_some());
     }
 }

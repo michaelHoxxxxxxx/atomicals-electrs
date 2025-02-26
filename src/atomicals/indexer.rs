@@ -4,6 +4,7 @@ use bitcoin::{OutPoint, Address, TxOut};
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 use std::sync::Arc;
+use bincode;
 
 use super::protocol::{AtomicalId, AtomicalType};
 use super::state::AtomicalOutput;
@@ -73,8 +74,9 @@ impl AtomicalsIndexer {
             .or_default()
             .push(entry.clone());
         
-        // 持久化到存储
-        self.storage.store_index(&key, &entry)?;
+        // 序列化并持久化到存储
+        let serialized = bincode::serialize(&entry)?;
+        self.storage.store_index(&key, &serialized[..])?;
         
         Ok(())
     }

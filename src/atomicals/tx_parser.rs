@@ -65,18 +65,28 @@ fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
     }
 }
 
-/// 解析交易中的 Atomicals 操作
-pub fn parse_transaction(tx: &Transaction) -> Result<Vec<AtomicalOperation>> {
-    let mut operations = Vec::new();
-    
-    // 遍历所有输出
-    for (vout, output) in tx.output.iter().enumerate() {
-        if let Some(operation) = parse_output(output, vout as u32) {
-            operations.push(operation);
-        }
+/// 交易解析器
+pub struct TxParser;
+
+impl TxParser {
+    /// 创建新的交易解析器
+    pub fn new() -> Self {
+        Self
     }
     
-    Ok(operations)
+    /// 解析交易中的 Atomicals 操作
+    pub fn parse_transaction(&self, tx: &Transaction) -> Result<Vec<AtomicalOperation>> {
+        let mut operations = Vec::new();
+        
+        // 遍历所有输出
+        for (vout, output) in tx.output.iter().enumerate() {
+            if let Some(operation) = parse_output(output, vout as u32) {
+                operations.push(operation);
+            }
+        }
+        
+        Ok(operations)
+    }
 }
 
 #[cfg(test)]
@@ -125,7 +135,8 @@ mod tests {
         });
 
         // 解析交易
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
@@ -164,7 +175,8 @@ mod tests {
         });
 
         // 解析交易
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
@@ -198,7 +210,8 @@ mod tests {
         });
 
         // 解析交易
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
@@ -233,7 +246,8 @@ mod tests {
         });
 
         // 解析交易
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
@@ -284,7 +298,8 @@ mod tests {
         });
 
         // 所有操作都应该被忽略
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 0);
     }
 
@@ -327,7 +342,8 @@ mod tests {
         });
 
         // 验证所有操作都被正确解析
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         assert_eq!(operations.len(), 3);
 
         // 验证每个操作的类型
@@ -384,7 +400,8 @@ mod tests {
         });
 
         // 验证处理
-        let operations = parse_transaction(&tx).unwrap();
+        let parser = TxParser::new();
+        let operations = parser.parse_transaction(&tx).unwrap();
         
         // 空脚本和只有前缀的脚本应该被忽略
         // 超大元数据应该能正常解析

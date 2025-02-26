@@ -14,6 +14,9 @@ mod metrics_impl {
 
     pub struct Metrics {
         reg: Registry,
+        pub mempool_count: prometheus::GaugeVec,
+        pub mempool_vsize: prometheus::GaugeVec,
+        pub mempool_pending_operations_count: prometheus::GaugeVec,
     }
 
     impl Metrics {
@@ -24,7 +27,32 @@ mod metrics_impl {
             reg.register(Box::new(ProcessCollector::for_self()))
                 .expect("failed to register ProcessCollector");
 
-            let result = Self { reg };
+            let mempool_count = prometheus::GaugeVec::new(
+                Opts::new("mempool_count", "Total number of mempool transactions"),
+                &["type"],
+            )?;
+            let mempool_vsize = prometheus::GaugeVec::new(
+                Opts::new("mempool_vsize", "Total vsize of mempool transactions"),
+                &["type"],
+            )?;
+            let mempool_pending_operations_count = prometheus::GaugeVec::new(
+                Opts::new(
+                    "mempool_pending_operations_count",
+                    "Total number of pending operations in mempool",
+                ),
+                &["type"],
+            )?;
+
+            reg.register(Box::new(mempool_count.clone()))?;
+            reg.register(Box::new(mempool_vsize.clone()))?;
+            reg.register(Box::new(mempool_pending_operations_count.clone()))?;
+
+            let result = Self { 
+                reg, 
+                mempool_count, 
+                mempool_vsize, 
+                mempool_pending_operations_count, 
+            };
             let reg = result.reg.clone();
 
             let server = match Server::http(addr) {
@@ -67,25 +95,11 @@ mod metrics_impl {
             Histogram { hist }
         }
 
-        pub fn gauge(&self, name: &str, desc: &str, label: &str) -> Gauge {
-            let name = String::from("electrs_") + name;
-            let opts = prometheus::Opts::new(name, desc);
+        pub fn gauge(&self, name: &str, help: &str, label: &str) -> prometheus::GaugeVec {
+            let opts = Opts::new(name, help);
             let gauge = prometheus::GaugeVec::new(opts, &[label]).unwrap();
-            self.reg
-                .register(Box::new(gauge.clone()))
-                .expect("failed to register Gauge");
-            Gauge { gauge }
-        }
-    }
-
-    #[derive(Clone)]
-    pub struct Gauge {
-        gauge: prometheus::GaugeVec,
-    }
-
-    impl Gauge {
-        pub fn set(&self, label: &str, value: f64) {
-            self.gauge.with_label_values(&[label]).set(value)
+            self.reg.register(Box::new(gauge.clone())).unwrap();
+            gauge
         }
     }
 
@@ -111,7 +125,7 @@ mod metrics_impl {
 }
 
 #[cfg(feature = "metrics")]
-pub use metrics_impl::{Gauge, Histogram, Metrics};
+pub use metrics_impl::{Histogram, Metrics};
 
 #[cfg(not(feature = "metrics"))]
 mod metrics_fake {
@@ -137,16 +151,12 @@ mod metrics_fake {
             Histogram {}
         }
 
-        pub fn gauge(&self, _name: &str, _desc: &str, _label: &str) -> Gauge {
-            Gauge {}
+        pub fn gauge(&self, _name: &str, _desc: &str, _label: &str) -> prometheus::GaugeVec {
+            prometheus::GaugeVec::new(
+                prometheus::Opts::new("dummy", "dummy"),
+                &["dummy"],
+            ).unwrap()
         }
-    }
-
-    #[derive(Clone)]
-    pub struct Gauge {}
-
-    impl Gauge {
-        pub fn set(&self, _label: &str, _value: f64) {}
     }
 
     #[derive(Clone)]
@@ -165,7 +175,7 @@ mod metrics_fake {
 }
 
 #[cfg(not(feature = "metrics"))]
-pub use metrics_fake::{Gauge, Histogram, Metrics};
+pub use metrics_fake::{Histogram, Metrics};
 
 pub(crate) fn default_duration_buckets() -> Vec<f64> {
     vec![

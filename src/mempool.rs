@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, ensure, Result};
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use log::warn;
 use parking_lot::RwLock;
 
 use crate::{
     daemon::Daemon,
-    metrics::{Gauge, Metrics},
+    metrics::{Gauge, Metrics, Counter},
     signals::ExitFlag,
     types::ScriptHash,
     atomicals::{AtomicalsState, AtomicalOperation},
@@ -33,6 +33,7 @@ pub struct Mempool {
     // stats
     vsize: Gauge,
     count: Gauge,
+    pending_operations_count: Gauge,
     atomicals: Arc<AtomicalsState>,
     pending_operations: RwLock<HashMap<Txid, Vec<AtomicalOperation>>>,
     fee_histogram: FeeHistogram,
@@ -62,6 +63,11 @@ impl Mempool {
                 "Total number of mempool transactions",
                 "fee_rate",
             ),
+            pending_operations_count: metrics.gauge(
+                "mempool_pending_operations_count",
+                "Total number of pending operations in mempool",
+                "fee_rate",
+            ),
             atomicals,
             pending_operations: RwLock::new(HashMap::new()),
             fee_histogram: FeeHistogram::new(),
@@ -89,7 +95,7 @@ impl Mempool {
             .collect()
     }
 
-    pub fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) {
+    pub async fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) {
         let txids = match daemon.get_mempool_txids() {
             Ok(txids) => txids,
             Err(e) => {
@@ -113,49 +119,33 @@ impl Mempool {
 
             match daemon.get_mempool_entry(&txid) {
                 Ok(entry) => {
-                    let tx = match daemon.get_transaction(&txid) {
+                    let tx = match daemon.get_transaction(&txid, None) {
                         Ok(tx) => tx,
                         Err(e) => {
-                            warn!("failed to get transaction {}: {}", txid, e);
+                            warn!("failed to get mempool transaction {}: {}", txid, e);
                             continue;
                         }
                     };
 
-                    let has_unconfirmed_inputs = tx
-                        .input
-                        .iter()
-                        .any(|txin| self.entries.contains_key(&txin.previous_output.txid));
-
                     let entry = Entry {
                         txid,
-                        tx,
-                        fee: Amount::from_sat(entry.fee),
+                        tx: tx.clone(),
+                        fee: Amount::from_sat(entry.fees.base.to_sat()),
                         vsize: entry.vsize,
-                        has_unconfirmed_inputs,
-                        fee_per_vbyte: entry.fee as f32 / entry.vsize as f32,
+                        has_unconfirmed_inputs: !entry.depends.is_empty(),
+                        fee_per_vbyte: (entry.fees.base.to_sat() as f32) / (entry.vsize as f32),
                     };
 
-                    // Update indexes
-                    for txin in &entry.tx.input {
-                        self.by_spending.insert((txin.previous_output, txid));
-                    }
-                    for (i, txout) in entry.tx.output.iter().enumerate() {
-                        let scripthash = ScriptHash::new(&txout.script_pubkey);
-                        self.by_funding.insert((scripthash, txid));
-                    }
-
-                    // Update stats
-                    self.vsize.inc_by(entry.vsize as i64);
+                    self.entries.insert(txid, entry);
                     self.count.inc();
 
                     // Process Atomicals operations
-                    if let Ok(operations) = self.atomicals.get_operations(&entry.tx) {
+                    if let Ok(operations) = self.atomicals.get_atomical_operations(&tx).await {
                         if !operations.is_empty() {
                             self.pending_operations.write().insert(txid, operations);
+                            self.pending_operations_count.inc();
                         }
                     }
-
-                    self.entries.insert(txid, entry);
                 }
                 Err(e) => {
                     warn!("failed to get mempool entry {}: {}", txid, e);
@@ -173,11 +163,12 @@ impl Mempool {
         let mut histogram = FeeHistogram::new();
         
         for tx in txs {
-            let size = tx.size() as f32;
-            let fee_rate = tx.output.iter()
+            let size = tx.vsize() as f32;
+            let fee = tx.output.iter()
                 .map(|o| o.value)
                 .sum::<Amount>()
-                .to_sat() as f32 / size;
+                .to_sat() as f32;
+            let fee_rate = fee / size;
                 
             histogram.add(fee_rate, 1);
         }
@@ -225,62 +216,6 @@ impl Mempool {
 
         Ok(())
     }
-
-    pub async fn update(&mut self, exit_flag: &ExitFlag) -> Result<()> {
-        // 获取新的 mempool 交易
-        let new_txids = self.daemon.get_mempool_txids().await?;
-        let mut missing_txids = new_txids
-            .iter()
-            .filter(|txid| !self.entries.contains_key(&txid))
-            .cloned()
-            .collect::<Vec<Txid>>();
-
-        // 获取新交易详情
-        while !missing_txids.is_empty() {
-            let batch = missing_txids.split_off(
-                missing_txids.len().saturating_sub(1000),
-            );
-            let txs = self.daemon.get_mempool_txs(&batch).await?;
-            for tx in txs {
-                let txid = tx.txid();
-                let fee = self.daemon.get_mempool_tx_fee(&txid).await?;
-                let vsize = tx.vsize() as f32;
-                let fee_per_vbyte = fee as f32 / vsize;
-
-                self.entries.insert(
-                    txid,
-                    Entry {
-                        tx,
-                        fee,
-                        vsize: tx.vsize(),
-                        has_unconfirmed_inputs: tx
-                            .input
-                            .iter()
-                            .any(|txin| self.entries.contains_key(&txin.previous_output.txid)),
-                        fee_per_vbyte,
-                    },
-                );
-            }
-            exit_flag.check().context("mempool update interrupted")?;
-        }
-
-        // 移除已确认或过期的交易
-        let mut removed = Vec::new();
-        for txid in self.entries.keys() {
-            if !new_txids.contains(txid) {
-                removed.push(*txid);
-            }
-        }
-        for txid in removed {
-            self.entries.remove(&txid);
-        }
-
-        // 更新统计信息
-        self.update_stats().await?;
-        self.update_fee_histogram().await?;
-
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -312,12 +247,12 @@ pub struct MempoolSyncUpdate {
 impl MempoolSyncUpdate {
     /// Poll the bitcoin node and compute a [`MempoolSyncUpdate`] based on the given set of
     /// `old_txids` which are already cached.
-    pub fn poll(
+    pub async fn poll(
         daemon: &Daemon,
         old_txids: HashSet<Txid>,
         exit_flag: &ExitFlag,
     ) -> Result<MempoolSyncUpdate> {
-        let txids = daemon.get_mempool_txids()?;
+        let txids = daemon.get_mempool_txids().await?;
         debug!("loading {} mempool transactions", txids.len());
 
         let new_txids = HashSet::<Txid>::from_iter(txids);
@@ -329,15 +264,17 @@ impl MempoolSyncUpdate {
         let mut new_entries = Vec::with_capacity(to_add.len());
 
         for txids_chunk in to_add.chunks(1000) {
-            exit_flag.poll().context("mempool update interrupted")?;
-            let entries = daemon.get_mempool_entries(txids_chunk)?;
+            if exit_flag.is_set() {
+                return Err(anyhow!("mempool update interrupted"));
+            }
+            let entries = daemon.get_mempool_entries(txids_chunk).await?;
             ensure!(
                 txids_chunk.len() == entries.len(),
                 "got {} mempools entries, expected {}",
                 entries.len(),
                 txids_chunk.len()
             );
-            let txs = daemon.get_mempool_transactions(txids_chunk)?;
+            let txs = daemon.get_mempool_transactions(txids_chunk).await?;
             ensure!(
                 txids_chunk.len() == txs.len(),
                 "got {} mempools transactions, expected {}",
@@ -364,11 +301,11 @@ impl MempoolSyncUpdate {
                     };
                     Some(Entry {
                         txid: *txid,
-                        tx,
+                        tx: tx.clone(),
+                        fee: Amount::from_sat(entry.fees.base.to_sat()),
                         vsize: entry.vsize,
-                        fee: entry.fees.base,
                         has_unconfirmed_inputs: !entry.depends.is_empty(),
-                        fee_per_vbyte: entry.fees.base as f32 / entry.vsize as f32,
+                        fee_per_vbyte: (entry.fees.base.to_sat() as f32) / (entry.vsize as f32),
                     })
                 })
                 .collect();

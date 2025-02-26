@@ -18,12 +18,18 @@ use crate::{
     },
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Stats {
     update_duration: Histogram,
     update_size: Histogram,
     height: Gauge,
     db_properties: Gauge,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        unimplemented!("Stats cannot be created without a Metrics instance")
+    }
 }
 
 impl Stats {
@@ -81,7 +87,6 @@ impl Stats {
 }
 
 /// Confirmed transactions' address index
-#[derive(Default)]
 pub struct Index {
     store: DBStore,
     batch_size: usize,
@@ -90,6 +95,12 @@ pub struct Index {
     stats: Stats,
     is_ready: bool,
     flush_needed: bool,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        unimplemented!("Index cannot be created without a Chain instance")
+    }
 }
 
 impl Index {
@@ -177,8 +188,8 @@ impl Index {
                 info!(
                     "indexing {} blocks: [{}..{}]",
                     count,
-                    first.height(),
-                    last.height()
+                    first.height,
+                    last.height
                 );
             }
             _ => {
@@ -200,12 +211,12 @@ impl Index {
                 .name("index_build".into())
                 .spawn_scoped(scope, move || -> Result<()> {
                     for chunk in chunks {
-                        exit_flag.poll().with_context(|| {
-                            format!(
+                        if exit_flag.is_set() {
+                            return Err(anyhow::anyhow!(
                                 "indexing interrupted at height: {}",
-                                chunk.first().unwrap().height()
-                            )
-                        })?;
+                                chunk.first().unwrap().height
+                            ));
+                        }
                         let batch = index.index_blocks(daemon, chunk)?;
                         tx.send(batch).context("writer disconnected")?;
                     }
@@ -225,7 +236,7 @@ impl Index {
                         stats.observe_db(&index.store);
                     }
                 })
-                .expect("spawn failed");
+                .expect("writer thread panic");
 
             reader.join().expect("reader thread panic")?;
             writer.join().expect("writer thread panic");
@@ -238,24 +249,17 @@ impl Index {
     }
 
     fn index_blocks(&self, daemon: &Daemon, chunk: &[NewHeader]) -> Result<WriteBatch> {
-        let blockhashes: Vec<BlockHash> = chunk.iter().map(|h| h.hash()).collect();
-        let mut heights = chunk.iter().map(|h| h.height());
+        let blockhashes: Vec<BlockHash> = chunk.iter().map(|h| h.header.block_hash()).collect();
+        let height = chunk.first().unwrap().height;
 
         let mut batch = WriteBatch::default();
 
         daemon.for_blocks(blockhashes, |blockhash, block| {
-            let height = heights.next().expect("unexpected block");
             self.stats.observe_duration("block", || {
                 index_single_block(blockhash, block, height, &mut batch);
             });
             self.stats.height.set("tip", height as f64);
         })?;
-        let heights: Vec<_> = heights.collect();
-        assert!(
-            heights.is_empty(),
-            "some blocks were not indexed: {:?}",
-            heights
-        );
         Ok(batch)
     }
 

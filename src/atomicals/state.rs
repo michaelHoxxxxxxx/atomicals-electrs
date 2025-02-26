@@ -41,6 +41,19 @@ impl AtomicalsState {
         })
     }
 
+    pub fn new(network: bitcoin::Network) -> Result<Self> {
+        let (broadcast_tx, _) = broadcast::channel(1024);
+        Ok(Self {
+            outputs: RwLock::new(HashMap::new()),
+            metadata: RwLock::new(HashMap::new()),
+            sealed: RwLock::new(HashMap::new()),
+            tx_parser: TxParser::new(),
+            storage: Arc::new(AtomicalsStorage::default()),
+            broadcast_tx,
+            network,
+        })
+    }
+
     pub async fn get_output(&self, atomical_id: &AtomicalId) -> Result<Option<AtomicalOutput>> {
         let outputs = self.outputs.read().await;
         Ok(outputs.get(atomical_id).cloned())
@@ -74,8 +87,14 @@ impl AtomicalsState {
         })
     }
 
-    pub async fn exists(&self, id: &AtomicalId) -> Result<bool> {
-        Ok(self.outputs.read().await.contains_key(id))
+    pub async fn exists_async(&self, id: &AtomicalId) -> Result<bool> {
+        let outputs = self.outputs.read().await;
+        Ok(outputs.contains_key(id))
+    }
+
+    pub fn exists(&self, id: &AtomicalId) -> Result<bool> {
+        let outputs = self.outputs.blocking_read();
+        Ok(outputs.contains_key(id))
     }
 
     pub async fn apply_operations(&mut self, operations: Vec<AtomicalOperation>, tx: &Transaction, height: u32, timestamp: u64) -> Result<()> {
@@ -140,14 +159,8 @@ impl AtomicalsState {
 
     /// 获取交易中的 Atomical 操作
     pub async fn get_atomical_operations(&self, tx: &Transaction) -> Result<Vec<AtomicalOperation>> {
-        let mut operations = Vec::new();
-        
-        // 解析交易中的操作
-        if let Some(op) = self.tx_parser.parse_atomical_operation(tx).await? {
-            operations.push(op);
-        }
-        
-        Ok(operations)
+        // 使用 TxParser 解析交易
+        self.tx_parser.parse_transaction(tx)
     }
 
     pub fn broadcast_tx(&self) -> broadcast::Sender<WsMessage> {
@@ -202,6 +215,133 @@ impl AtomicalsState {
         let _ = self.broadcast_tx.send(WsMessage::NewOperation(notification));
         Ok(())
     }
+
+    /// 获取封印的 Atomical 数量
+    pub async fn get_sealed_count(&self) -> Result<usize> {
+        let sealed = self.sealed.read().await;
+        let count = sealed.values().filter(|&&sealed| sealed).count();
+        Ok(count)
+    }
+
+    /// 获取封印的 Atomical 数量（同步版本）
+    pub fn get_sealed_count_sync(&self) -> Result<usize> {
+        let sealed = self.sealed.blocking_read();
+        let count = sealed.values().filter(|&&sealed| sealed).count();
+        Ok(count)
+    }
+
+    /// 获取总的 Atomical 数量
+    pub async fn get_total_count(&self) -> Result<usize> {
+        let outputs = self.outputs.read().await;
+        Ok(outputs.len())
+    }
+
+    /// 获取总的 Atomical 数量（同步版本）
+    pub fn get_total_count_sync(&self) -> Result<usize> {
+        let outputs = self.outputs.blocking_read();
+        Ok(outputs.len())
+    }
+
+    /// 获取 NFT 类型的 Atomical 数量
+    pub async fn get_nft_count(&self) -> Result<usize> {
+        let outputs = self.outputs.read().await;
+        let count = outputs.values()
+            .filter(|output| output.atomical_type == AtomicalType::NFT)
+            .count();
+        Ok(count)
+    }
+
+    /// 获取 NFT 类型的 Atomical 数量（同步版本）
+    pub fn get_nft_count_sync(&self) -> Result<usize> {
+        let outputs = self.outputs.blocking_read();
+        let count = outputs.values()
+            .filter(|output| output.atomical_type == AtomicalType::NFT)
+            .count();
+        Ok(count)
+    }
+
+    /// 获取 FT 类型的 Atomical 数量
+    pub async fn get_ft_count(&self) -> Result<usize> {
+        let outputs = self.outputs.read().await;
+        let count = outputs.values()
+            .filter(|output| output.atomical_type == AtomicalType::FT)
+            .count();
+        Ok(count)
+    }
+
+    /// 获取 FT 类型的 Atomical 数量（同步版本）
+    pub fn get_ft_count_sync(&self) -> Result<usize> {
+        let outputs = self.outputs.blocking_read();
+        let count = outputs.values()
+            .filter(|output| output.atomical_type == AtomicalType::FT)
+            .count();
+        Ok(count)
+    }
+
+    /// 获取待处理的操作
+    pub fn get_pending_operations(&self) -> Result<HashMap<bitcoin::Txid, Vec<AtomicalOperation>>> {
+        // 这里应该从某个地方获取待处理的操作
+        // 由于没有具体实现，暂时返回空的 HashMap
+        Ok(HashMap::new())
+    }
+
+    /// 添加 Atomical
+    pub fn add_atomical(&self, atomical_id: &AtomicalId, atomical_type: AtomicalType) -> Result<()> {
+        // 创建默认的 AtomicalOutput
+        let output = AtomicalOutput {
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut::default(),
+            metadata: None,
+            height: 0,
+            timestamp: 0,
+            atomical_type,
+            sealed: false,
+        };
+        
+        // 存储到 outputs
+        let mut outputs = self.outputs.blocking_write();
+        outputs.insert(atomical_id.clone(), output);
+        
+        // 初始化 sealed 状态
+        let mut sealed = self.sealed.blocking_write();
+        sealed.insert(atomical_id.clone(), false);
+        
+        Ok(())
+    }
+    
+    /// 封印 Atomical
+    pub fn seal_atomical(&self, atomical_id: &AtomicalId) -> Result<()> {
+        // 更新 sealed 状态
+        let mut sealed = self.sealed.blocking_write();
+        sealed.insert(atomical_id.clone(), true);
+        
+        // 更新 output 中的 sealed 状态
+        let mut outputs = self.outputs.blocking_write();
+        if let Some(output) = outputs.get_mut(atomical_id) {
+            output.sealed = true;
+        }
+        
+        Ok(())
+    }
+
+    /// 检查 Atomical 是否被封印
+    pub fn is_sealed(&self, id: &AtomicalId) -> Result<bool> {
+        let sealed = self.sealed.blocking_read();
+        Ok(sealed.get(id).copied().unwrap_or(false))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtomicalOutput {
+    pub txid: bitcoin::Txid,
+    pub vout: u32,
+    pub output: TxOut,
+    pub metadata: Option<Value>,
+    pub height: u32,
+    pub timestamp: u64,
+    pub atomical_type: AtomicalType,
+    pub sealed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -151,3 +151,21 @@ doc = "Logging filters, overriding `RUST_LOG` environment variable (see https://
 name = "signet_magic"
 type = "String"
 doc = "network magic for custom signet network in hex format, as found in Bitcoin Core logs (signet only)"
+
+[[param]]
+name = "websocket_port"
+type = "u16"
+doc = "WebSocket server port (default: 50002 for mainnet, 60002 for testnet, 60402 for regtest and 60602 for signet)"
+default = "50002"
+
+[[param]]
+name = "websocket_max_connections"
+type = "usize"
+doc = "Maximum number of WebSocket connections (default: 100)"
+default = "100"
+
+[[param]]
+name = "websocket_heartbeat_interval"
+type = "u64"
+doc = "WebSocket heartbeat interval in seconds (default: 30)"
+default = "30"

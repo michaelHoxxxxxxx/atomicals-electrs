@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::protocol::{AtomicalId, AtomicalType};
 use super::state::AtomicalOutput;
+use super::indexer::IndexEntry;
 
 const CF_STATE: &str = "state";
 const CF_OUTPUTS: &str = "outputs";
@@ -113,6 +114,37 @@ impl AtomicalsStorage {
         }
     }
 
+    /// 搜索元数据
+    pub fn search_metadata(&self, query: &str) -> Result<Vec<AtomicalId>> {
+        let cf = self.db.cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_METADATA))?;
+        
+        let mut results = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            let parts: Vec<&str> = key_str.split(':').collect();
+            
+            if parts.len() != 2 {
+                continue;
+            }
+            
+            let metadata: serde_json::Value = serde_json::from_slice(&value)?;
+            let metadata_str = serde_json::to_string(&metadata)?;
+            
+            // 简单的文本搜索
+            if metadata_str.to_lowercase().contains(&query.to_lowercase()) {
+                let txid = bitcoin::Txid::from_str(parts[0])?;
+                let vout = parts[1].parse::<u32>()?;
+                results.push(AtomicalId { txid, vout });
+            }
+        }
+        
+        Ok(results)
+    }
+
     /// 存储索引
     pub fn store_index(&self, key: &str, value: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_INDEXES)
@@ -123,7 +155,7 @@ impl AtomicalsStorage {
     }
 
     /// 加载所有索引
-    pub fn load_all_indexes(&self) -> Result<Vec<Vec<u8>>> {
+    pub fn load_all_indexes(&self) -> Result<Vec<IndexEntry>> {
         let cf = self.db.cf_handle(CF_INDEXES)
             .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
         
@@ -132,10 +164,38 @@ impl AtomicalsStorage {
         
         for item in iter {
             let (_, value) = item?;
-            indexes.push(value.to_vec());
+            let entry: IndexEntry = bincode::deserialize(&value)?;
+            indexes.push(entry);
         }
         
         Ok(indexes)
+    }
+
+    /// 根据脚本获取 Atomicals
+    pub fn get_atomicals_by_script(&self, script: &[u8]) -> Result<Vec<AtomicalId>> {
+        let cf = self.db.cf_handle(CF_INDEXES)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
+        
+        let key = format!("script:{}", hex::encode(script));
+        
+        if let Some(value) = self.db.get_cf(&cf, key.as_bytes())? {
+            let atomicals: Vec<AtomicalId> = bincode::deserialize(&value)?;
+            Ok(atomicals)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 存储脚本与 Atomicals 的关系
+    pub fn store_script_atomicals(&self, script: &[u8], atomicals: &[AtomicalId]) -> Result<()> {
+        let cf = self.db.cf_handle(CF_INDEXES)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
+        
+        let key = format!("script:{}", hex::encode(script));
+        let value = bincode::serialize(atomicals)?;
+        
+        self.db.put_cf(&cf, key.as_bytes(), value)?;
+        Ok(())
     }
 
     /// 压缩数据库
@@ -148,6 +208,14 @@ impl AtomicalsStorage {
         }
         
         Ok(())
+    }
+}
+
+impl Default for AtomicalsStorage {
+    fn default() -> Self {
+        // 创建临时目录
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+        Self::new(temp_dir.path()).expect("Failed to create storage")
     }
 }
 
@@ -259,23 +327,30 @@ mod tests {
     fn test_index_operations() -> Result<()> {
         let (storage, _temp_dir) = create_test_storage();
         
-        // 测试存储索引
         let test_indexes = vec![
-            ("index1", b"value1"),
-            ("index2", b"value2"),
-            ("index3", b"value3"),
+            IndexEntry {
+                key: "key1".to_string(),
+                value: vec![1, 2, 3],
+            },
+            IndexEntry {
+                key: "key2".to_string(),
+                value: vec![4, 5, 6],
+            },
+            IndexEntry {
+                key: "key3".to_string(),
+                value: vec![7, 8, 9],
+            },
         ];
         
-        for (key, value) in &test_indexes {
-            storage.store_index(key, value)?;
+        for entry in test_indexes.iter() {
+            storage.store_index(&entry.key, &entry.value)?;
         }
         
-        // 测试加载所有索引
         let loaded_indexes = storage.load_all_indexes()?;
         assert_eq!(loaded_indexes.len(), test_indexes.len());
         
-        for (i, value) in test_indexes.iter().enumerate() {
-            assert!(loaded_indexes.contains(&value.1.to_vec()));
+        for test_entry in test_indexes.iter() {
+            assert!(loaded_indexes.iter().any(|entry| entry.key == test_entry.key && entry.value == test_entry.value));
         }
         
         Ok(())

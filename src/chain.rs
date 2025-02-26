@@ -13,6 +13,12 @@ pub(crate) struct NewHeader {
     pub height: usize,
 }
 
+impl From<(BlockHeader, usize)> for NewHeader {
+    fn from((header, height): (BlockHeader, usize)) -> Self {
+        NewHeader { header, height }
+    }
+}
+
 #[derive(Debug)]
 pub struct Chain {
     headers: Vec<(BlockHash, BlockHeader)>,
@@ -87,7 +93,10 @@ impl Chain {
         }
         info!("loading {} headers, tip={}", new_headers.len(), tip);
         let new_headers = new_headers.into_iter().rev().copied(); // order by height
-        self.update(new_headers.zip(1..).map(NewHeader::from).collect())
+        self.update(new_headers.zip(1..).map(|(header, height)| NewHeader {
+            header,
+            height,
+        }).collect())
     }
 
     /// Get the block hash at specified height (if exists)

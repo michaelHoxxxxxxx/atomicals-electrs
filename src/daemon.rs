@@ -112,9 +112,9 @@ impl Daemon {
         let mut rpc = rpc_connect(config)?;
 
         loop {
-            exit_flag
-                .poll()
-                .context("bitcoin RPC polling interrupted")?;
+            if exit_flag.is_set() {
+                return Err(anyhow::anyhow!("bitcoin RPC polling interrupted"));
+            }
             match rpc_poll(&mut rpc, config.skip_block_download_wait) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
