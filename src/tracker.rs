@@ -79,7 +79,7 @@ impl Tracker {
             interval.tick().await;
 
             // 同步 mempool
-            self.mempool.sync(&self.daemon, exit_flag)?;
+            self.mempool.sync(&self.daemon, exit_flag).await;
 
             // 更新统计信息
             self.update_stats();

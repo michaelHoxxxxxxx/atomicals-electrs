@@ -152,27 +152,6 @@ impl Chain {
         }
         result
     }
-
-    /// Process Atomicals transaction
-    pub(crate) fn process_atomicals_transaction(
-        &self,
-        _tx: &Transaction,
-        _height: u32,
-        _timestamp: u64,
-    ) -> Result<()> {
-        // 实现处理 Atomicals 交易的逻辑
-        Ok(())
-    }
-
-    /// Handle chain reorganization
-    pub(crate) fn handle_reorg(
-        &self,
-        _old_tip: &BlockHash,
-        _new_tip: &BlockHash,
-    ) -> Result<()> {
-        // 实现处理重组的逻辑
-        Ok(())
-    }
 }
 
 #[cfg(test)]

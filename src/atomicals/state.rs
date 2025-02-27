@@ -41,7 +41,7 @@ impl AtomicalsState {
         })
     }
 
-    pub fn new(network: bitcoin::Network) -> Result<Self> {
+    pub fn new_default(network: bitcoin::Network) -> Result<Self> {
         let (broadcast_tx, _) = broadcast::channel(1024);
         Ok(Self {
             outputs: RwLock::new(HashMap::new()),
@@ -64,6 +64,16 @@ impl AtomicalsState {
         Ok(metadata.get(atomical_id).cloned())
     }
 
+    pub fn get_output_sync(&self, atomical_id: &AtomicalId) -> Result<Option<AtomicalOutput>> {
+        let outputs = self.outputs.blocking_read();
+        Ok(outputs.get(atomical_id).cloned())
+    }
+
+    pub fn get_metadata_sync(&self, atomical_id: &AtomicalId) -> Result<Option<Value>> {
+        let metadata = self.metadata.blocking_read();
+        Ok(metadata.get(atomical_id).cloned())
+    }
+
     pub async fn get_atomical_info(&self, id: &AtomicalId) -> Result<AtomicalInfo> {
         let outputs = self.outputs.read().await;
         let output = outputs.get(id).ok_or_else(|| anyhow::anyhow!("Atomical not found"))?;
@@ -76,7 +86,7 @@ impl AtomicalsState {
         
         Ok(AtomicalInfo {
             id: id.clone(),
-            owner: Address::from_script(&output.output.script_pubkey, self.network).ok(),
+            owner: Address::from_script(&output.output.script_pubkey, self.network).map(|addr| addr.to_string()),
             metadata: metadata_value,
             state: None,
             atomical_type: output.atomical_type.clone(),
@@ -285,13 +295,15 @@ impl AtomicalsState {
         Ok(HashMap::new())
     }
 
-    /// 添加 Atomical
     pub fn add_atomical(&self, atomical_id: &AtomicalId, atomical_type: AtomicalType) -> Result<()> {
         // 创建默认的 AtomicalOutput
         let output = AtomicalOutput {
             txid: atomical_id.txid,
             vout: atomical_id.vout,
-            output: TxOut::default(),
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: bitcoin::Script::new().into(),
+            },
             metadata: None,
             height: 0,
             timestamp: 0,
@@ -347,9 +359,9 @@ pub struct AtomicalOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicalInfo {
     pub id: AtomicalId,
-    pub owner: Option<Address>,
+    pub owner: Option<String>,
     pub metadata: Option<Value>,
-    pub state: Option<String>,
+    pub state: Option<Value>,
     pub atomical_type: AtomicalType,
     pub value: u64,
     pub created_height: u32,

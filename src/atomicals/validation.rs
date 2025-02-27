@@ -32,7 +32,7 @@ pub fn validate_operation(
         AtomicalOperation::Mint { atomical_type, metadata } => {
             validate_mint(atomical_type, metadata)
         }
-        AtomicalOperation::Update { atomical_id, metadata } => {
+        AtomicalOperation::Update { atomical_id, metadata: _  } => {
             validate_update(state, tx, atomical_id)
         }
         AtomicalOperation::Seal { atomical_id } => {
@@ -45,7 +45,7 @@ pub fn validate_operation(
             }
 
             // 检查输出索引是否有效
-            if output_index as usize >= tx.output.len() {
+            if *output_index as usize >= tx.output.len() {
                 return Err(anyhow!("Invalid output index"));
             }
 
@@ -60,7 +60,10 @@ pub fn validate_operation(
 }
 
 /// 验证铸造操作
-fn validate_mint(atomical_type: &AtomicalType, metadata: &Value) -> Result<()> {
+fn validate_mint(atomical_type: &AtomicalType, metadata: &Option<Value>) -> Result<()> {
+    // 检查元数据是否存在
+    let metadata = metadata.as_ref().ok_or_else(|| anyhow!("Metadata is required"))?;
+    
     // 验证元数据
     if !metadata.is_object() {
         return Err(anyhow!("Metadata must be a JSON object"));
@@ -176,7 +179,7 @@ mod tests {
             "name": "Test NFT",
             "description": "Test Description",
         });
-        assert!(validate_mint(&AtomicalType::NFT, &nft_metadata).is_ok());
+        assert!(validate_mint(&AtomicalType::NFT, &Some(nft_metadata)).is_ok());
         
         // 测试 FT 铸造
         let ft_metadata = serde_json::json!({
@@ -184,62 +187,65 @@ mod tests {
             "max_supply": 1000000,
             "description": "Test Token",
         });
-        assert!(validate_mint(&AtomicalType::FT, &ft_metadata).is_ok());
+        assert!(validate_mint(&AtomicalType::FT, &Some(ft_metadata)).is_ok());
         
         // 测试 DID 铸造
         let did_metadata = serde_json::json!({
             "did": "did:example:123",
             "description": "Test DID",
         });
-        assert!(validate_mint(&AtomicalType::DID, &did_metadata).is_ok());
+        assert!(validate_mint(&AtomicalType::DID, &Some(did_metadata)).is_ok());
 
         // 测试 Container 铸造
         let container_metadata = serde_json::json!({
             "container_name": "test_container",
             "description": "Test Container",
         });
-        assert!(validate_mint(&AtomicalType::Container, &container_metadata).is_ok());
+        assert!(validate_mint(&AtomicalType::Container, &Some(container_metadata)).is_ok());
 
         // 测试 Realm 铸造
         let realm_metadata = serde_json::json!({
             "realm_name": "test_realm",
             "description": "Test Realm",
         });
-        assert!(validate_mint(&AtomicalType::Realm, &realm_metadata).is_ok());
+        assert!(validate_mint(&AtomicalType::Realm, &Some(realm_metadata)).is_ok());
         
         // 测试无效的 NFT 元数据
         let invalid_nft_metadata = serde_json::json!({
             "description": "Missing name field",
         });
-        assert!(validate_mint(&AtomicalType::NFT, &invalid_nft_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::NFT, &Some(invalid_nft_metadata)).is_err());
         
         // 测试无效的 FT 元数据
         let invalid_ft_metadata = serde_json::json!({
             "description": "Missing ticker and max_supply fields",
         });
-        assert!(validate_mint(&AtomicalType::FT, &invalid_ft_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::FT, &Some(invalid_ft_metadata)).is_err());
 
         // 测试无效的 DID 元数据
         let invalid_did_metadata = serde_json::json!({
             "description": "Missing did field",
         });
-        assert!(validate_mint(&AtomicalType::DID, &invalid_did_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::DID, &Some(invalid_did_metadata)).is_err());
 
         // 测试无效的 Container 元数据
         let invalid_container_metadata = serde_json::json!({
             "description": "Missing container_name field",
         });
-        assert!(validate_mint(&AtomicalType::Container, &invalid_container_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::Container, &Some(invalid_container_metadata)).is_err());
 
         // 测试无效的 Realm 元数据
         let invalid_realm_metadata = serde_json::json!({
             "description": "Missing realm_name field",
         });
-        assert!(validate_mint(&AtomicalType::Realm, &invalid_realm_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::Realm, &Some(invalid_realm_metadata)).is_err());
 
         // 测试非对象元数据
         let invalid_metadata = serde_json::json!("not an object");
-        assert!(validate_mint(&AtomicalType::NFT, &invalid_metadata).is_err());
+        assert!(validate_mint(&AtomicalType::NFT, &Some(invalid_metadata)).is_err());
+
+        // 测试缺失元数据
+        assert!(validate_mint(&AtomicalType::NFT, &None).is_err());
     }
 
     #[test]

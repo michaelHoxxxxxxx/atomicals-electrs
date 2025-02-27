@@ -117,38 +117,44 @@ impl Mempool {
                 continue;
             }
 
-            match daemon.get_mempool_entry(&txid) {
-                Ok(entry) => {
-                    let tx = match daemon.get_transaction(&txid, None) {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            warn!("failed to get mempool transaction {}: {}", txid, e);
-                            continue;
+            let entries_result = daemon.get_mempool_entries(&[txid]);
+            match entries_result {
+                Ok(entries) => {
+                    if let Some(Some(entry)) = entries.get(0).cloned() {
+                        let tx = match daemon.get_transaction(&txid, None) {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                warn!("failed to get mempool transaction {}: {}", txid, e);
+                                continue;
+                            }
+                        };
+
+                        let entry = Entry {
+                            txid,
+                            tx: tx.clone(),
+                            fee: Amount::from_sat(entry.fees.base.to_sat()),
+                            vsize: entry.vsize,
+                            has_unconfirmed_inputs: !entry.depends.is_empty(),
+                            fee_per_vbyte: (entry.fees.base.to_sat() as f32) / (entry.vsize as f32),
+                        };
+
+                        self.entries.insert(txid, entry);
+                        self.count.inc();
+
+                        // Process Atomicals operations
+                        if let Ok(operations) = self.atomicals.get_atomical_operations(&tx).await {
+                            if !operations.is_empty() {
+                                self.pending_operations.write().insert(txid, operations);
+                                self.pending_operations_count.inc();
+                            }
                         }
-                    };
-
-                    let entry = Entry {
-                        txid,
-                        tx: tx.clone(),
-                        fee: Amount::from_sat(entry.fees.base.to_sat()),
-                        vsize: entry.vsize,
-                        has_unconfirmed_inputs: !entry.depends.is_empty(),
-                        fee_per_vbyte: (entry.fees.base.to_sat() as f32) / (entry.vsize as f32),
-                    };
-
-                    self.entries.insert(txid, entry);
-                    self.count.inc();
-
-                    // Process Atomicals operations
-                    if let Ok(operations) = self.atomicals.get_atomical_operations(&tx).await {
-                        if !operations.is_empty() {
-                            self.pending_operations.write().insert(txid, operations);
-                            self.pending_operations_count.inc();
-                        }
+                    } else {
+                        warn!("failed to get mempool entry for txid: {}", txid);
+                        continue;
                     }
                 }
                 Err(e) => {
-                    warn!("failed to get mempool entry {}: {}", txid, e);
+                    warn!("failed to get mempool entries: {}", e);
                     continue;
                 }
             }
@@ -180,7 +186,7 @@ impl Mempool {
         let mut entries: Vec<Entry> = self.entries.values().cloned().collect();
         entries.sort_unstable_by(|a, b| a.fee_per_vbyte.partial_cmp(&b.fee_per_vbyte).unwrap());
 
-        let mut histogram = self.fee_histogram.write().await;
+        let histogram = &mut self.fee_histogram.clone();
         histogram.clear();
         let mut vsize_sum = 0f32;
 
@@ -188,7 +194,7 @@ impl Mempool {
             if let Ok(operations) = self.atomicals.get_atomical_operations(&entry.tx).await {
                 if !operations.is_empty() {
                     vsize_sum += entry.tx.vsize() as f32;
-                    histogram.push((entry.fee_per_vbyte, vsize_sum));
+                    histogram.0.push((entry.fee_per_vbyte, vsize_sum as u32));
                 }
             }
         }
@@ -205,11 +211,11 @@ impl Mempool {
             let tx = &entry.tx;
             let tx_vsize = tx.vsize() as f32;
             vsize += tx_vsize;
-            fee += entry.fee;
+            fee += entry.fee.to_sat();
             count += 1;
         }
 
-        let mut stats = self.stats.write().await;
+        let mut stats = self.stats.write();
         stats.vsize = vsize;
         stats.fee = fee;
         stats.count = count;
@@ -233,6 +239,14 @@ impl FeeHistogram {
     pub fn as_slice(&self) -> &[(f32, u32)] {
         &self.0
     }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn push(&mut self, value: (f32, u32)) {
+        self.0.push(value);
+    }
 }
 
 /// An update to [`Mempool`]'s internal state. This can be fetched
@@ -252,7 +266,7 @@ impl MempoolSyncUpdate {
         old_txids: HashSet<Txid>,
         exit_flag: &ExitFlag,
     ) -> Result<MempoolSyncUpdate> {
-        let txids = daemon.get_mempool_txids().await?;
+        let txids = daemon.get_mempool_txids()?;
         debug!("loading {} mempool transactions", txids.len());
 
         let new_txids = HashSet::<Txid>::from_iter(txids);
@@ -267,14 +281,14 @@ impl MempoolSyncUpdate {
             if exit_flag.is_set() {
                 return Err(anyhow!("mempool update interrupted"));
             }
-            let entries = daemon.get_mempool_entries(txids_chunk).await?;
+            let entries = daemon.get_mempool_entries(txids_chunk)?;
             ensure!(
                 txids_chunk.len() == entries.len(),
                 "got {} mempools entries, expected {}",
                 entries.len(),
                 txids_chunk.len()
             );
-            let txs = daemon.get_mempool_transactions(txids_chunk).await?;
+            let txs = daemon.get_mempool_transactions(txids_chunk)?;
             ensure!(
                 txids_chunk.len() == txs.len(),
                 "got {} mempools transactions, expected {}",

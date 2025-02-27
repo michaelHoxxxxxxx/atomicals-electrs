@@ -7,7 +7,7 @@ use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
 const ATOMICALS_PREFIX: &[u8] = b"atom";
 
 /// 解析输出脚本中的 Atomicals 操作
-fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
+fn parse_output(output: &TxOut, _vout: u32) -> Option<AtomicalOperation> {
     let script = output.script_pubkey.as_bytes();
     
     // 检查是否是 Atomicals 操作
@@ -30,7 +30,7 @@ fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
         "update" => {
             // 解析更新操作
             let atomical_id = AtomicalId {
-                txid: bitcoin::Txid::from_slice(&script[ATOMICALS_PREFIX.len() + 6..38]).ok()?,
+                txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_slice(&script[ATOMICALS_PREFIX.len() + 6..38]).ok()?),
                 vout: u32::from_be_bytes(script[38..42].try_into().ok()?),
             };
             let metadata = serde_json::from_slice(&script[42..]).ok()?;
@@ -42,7 +42,7 @@ fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
         "seal" => {
             // 解析封印操作
             let atomical_id = AtomicalId {
-                txid: bitcoin::Txid::from_slice(&script[ATOMICALS_PREFIX.len() + 4..36]).ok()?,
+                txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_slice(&script[ATOMICALS_PREFIX.len() + 4..36]).ok()?),
                 vout: u32::from_be_bytes(script[36..40].try_into().ok()?),
             };
             Some(AtomicalOperation::Seal {
@@ -52,7 +52,7 @@ fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
         "transfer" => {
             // 解析转移操作
             let atomical_id = AtomicalId {
-                txid: bitcoin::Txid::from_slice(&script[ATOMICALS_PREFIX.len() + 8..40]).ok()?,
+                txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_slice(&script[ATOMICALS_PREFIX.len() + 8..40]).ok()?),
                 vout: u32::from_be_bytes(script[40..44].try_into().ok()?),
             };
             let output_index = u32::from_be_bytes(script[44..48].try_into().ok()?);
@@ -66,6 +66,7 @@ fn parse_output(output: &TxOut, vout: u32) -> Option<AtomicalOperation> {
 }
 
 /// 交易解析器
+#[derive(Debug)]
 pub struct TxParser;
 
 impl TxParser {

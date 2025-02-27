@@ -194,7 +194,7 @@ impl HeaderRow {
 }
 
 pub(crate) fn bsl_txid(tx: &bsl::Transaction) -> Txid {
-    bitcoin::Txid::from_slice(tx.txid_sha2().as_slice()).expect("invalid txid")
+    bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_slice(tx.txid_sha2().as_slice()).expect("invalid txid"))
 }
 
 #[cfg(test)]

@@ -1,10 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bitcoin::{TxOut, Txid};
 use electrs_rocksdb::{DB, IteratorMode, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
+use hex;
 
 use super::protocol::{AtomicalId, AtomicalType};
 use super::state::AtomicalOutput;
@@ -16,6 +18,7 @@ const CF_METADATA: &str = "metadata";
 const CF_INDEXES: &str = "indexes";
 
 /// Atomicals 存储
+#[derive(Debug)]
 pub struct AtomicalsStorage {
     /// RocksDB 实例
     db: Arc<DB>,
@@ -136,7 +139,7 @@ impl AtomicalsStorage {
             
             // 简单的文本搜索
             if metadata_str.to_lowercase().contains(&query.to_lowercase()) {
-                let txid = bitcoin::Txid::from_str(parts[0])?;
+                let txid = Txid::from_str(parts[0])?;
                 let vout = parts[1].parse::<u32>()?;
                 results.push(AtomicalId { txid, vout });
             }

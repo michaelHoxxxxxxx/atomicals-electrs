@@ -18,7 +18,7 @@ pub struct AtomicalInfo {
     /// Atomical ID
     pub id: AtomicalId,
     /// 所有者地址
-    pub owner: Option<Address>,
+    pub owner: Option<String>,
     /// 元数据
     pub metadata: Option<Value>,
     /// 状态
@@ -62,24 +62,24 @@ impl AtomicalsRpc {
             return Err(anyhow!("Atomical not found"));
         }
 
-        // 获取输出信息
-        let output = self.state.get_output(id)?.ok_or_else(|| anyhow!("Output not found"))?;
+        // 获取输出
+        let output = self.state.get_output_sync(id)?.ok_or_else(|| anyhow!("Output not found"))?;
 
         // 获取元数据
-        let metadata = self.state.get_metadata(id)?;
+        let metadata = self.state.get_metadata_sync(id)?;
 
         // 获取封印状态
         let sealed = self.state.is_sealed(id)?;
 
         // 转换地址
-        let owner = Address::from_script(&bitcoin::Script::from_bytes(&output.owner.script_pubkey), self.network)
+        let owner = Address::from_script(&bitcoin::Script::from_bytes(&output.output.script_pubkey.as_bytes()), self.network)
             .map_err(|_| anyhow!("Invalid script"))?;
 
         Ok(AtomicalInfo {
             id: id.clone(),
             atomical_type: AtomicalType::NFT, // 从状态中获取
-            owner: Some(owner),
-            value: output.owner.value,
+            owner: Some(owner.to_string()),
+            value: output.output.value.to_sat(),
             metadata,
             created_height: output.height,
             created_timestamp: output.timestamp,
