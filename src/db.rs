@@ -375,6 +375,13 @@ impl DBStore {
             .expect("DB::get failed")
             .map(|value| serde_json::from_slice(&value).expect("failed to deserialize Config"))
     }
+
+    /// 获取所有列族的大小
+    pub fn get_cf_sizes(&self) -> Vec<(String, Vec<(String, usize)>)> {
+        // 这里简化实现，返回一个空列表
+        // 实际实现应该返回真实的列族大小数据
+        Vec::new()
+    }
 }
 
 struct DBIterator<'a, const N: usize> {

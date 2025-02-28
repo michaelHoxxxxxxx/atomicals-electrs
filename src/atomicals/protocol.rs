@@ -1,5 +1,7 @@
 use bitcoin::{OutPoint, Txid};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 /// Atomical ID is a unique identifier for an Atomical
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,11 +38,40 @@ pub enum AtomicalType {
     Realm,
 }
 
+impl fmt::Display for AtomicalType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AtomicalType::NFT => write!(f, "NFT"),
+            AtomicalType::FT => write!(f, "FT"),
+            AtomicalType::DID => write!(f, "DID"),
+            AtomicalType::Container => write!(f, "Container"),
+            AtomicalType::Realm => write!(f, "Realm"),
+        }
+    }
+}
+
+impl FromStr for AtomicalType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "NFT" => Ok(AtomicalType::NFT),
+            "FT" => Ok(AtomicalType::FT),
+            "DID" => Ok(AtomicalType::DID),
+            "Container" => Ok(AtomicalType::Container),
+            "Realm" => Ok(AtomicalType::Realm),
+            _ => Err(format!("Unknown AtomicalType: {}", s)),
+        }
+    }
+}
+
 /// Operation type for Atomicals
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AtomicalOperation {
     /// Mint a new Atomical
     Mint {
+        /// ID of the Atomical being minted
+        atomical_id: AtomicalId,
         /// Type of Atomical being minted
         atomical_type: AtomicalType,
         /// Optional metadata for the Atomical
@@ -49,21 +80,21 @@ pub enum AtomicalOperation {
     /// Transfer an existing Atomical
     Transfer {
         /// ID of the Atomical being transferred
-        atomical_id: AtomicalId,
+        id: AtomicalId,
         /// Destination output index
         output_index: u32,
     },
     /// Update Atomical metadata
     Update {
         /// ID of the Atomical being updated
-        atomical_id: AtomicalId,
+        id: AtomicalId,
         /// New metadata
         metadata: serde_json::Value,
     },
     /// Seal an Atomical (make it immutable)
     Seal {
         /// ID of the Atomical being sealed
-        atomical_id: AtomicalId,
+        id: AtomicalId,
     },
 }
 
@@ -214,7 +245,11 @@ mod tests {
             ]
         });
 
+        let txid = Txid::from_hex("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
+        let atomical_id = AtomicalId { txid, vout: 0 };
+
         let mint_op = AtomicalOperation::Mint {
+            atomical_id,
             atomical_type: AtomicalType::NFT,
             metadata: Some(metadata.clone()),
         };
@@ -227,6 +262,7 @@ mod tests {
 
         // Test mint operation without metadata
         let mint_op_no_metadata = AtomicalOperation::Mint {
+            atomical_id,
             atomical_type: AtomicalType::FT,
             metadata: None,
         };
@@ -243,6 +279,7 @@ mod tests {
             AtomicalType::Realm,
         ] {
             let op = AtomicalOperation::Mint {
+                atomical_id,
                 atomical_type,
                 metadata: Some(json!({"name": format!("Test {:#?}", atomical_type)})),
             };
@@ -263,7 +300,7 @@ mod tests {
 
         // Test transfer operation
         let transfer_op = AtomicalOperation::Transfer {
-            atomical_id,
+            id: atomical_id,
             output_index: 1,
         };
 
@@ -276,7 +313,7 @@ mod tests {
         // Test transfer with different output indices
         for output_index in 0..5 {
             let op = AtomicalOperation::Transfer {
-                atomical_id,
+                id: atomical_id,
                 output_index,
             };
             assert!(op.is_transfer());
@@ -301,7 +338,7 @@ mod tests {
         });
 
         let update_op = AtomicalOperation::Update {
-            atomical_id,
+            id: atomical_id,
             metadata: simple_metadata.clone(),
         };
 
@@ -335,7 +372,7 @@ mod tests {
         });
 
         let complex_update_op = AtomicalOperation::Update {
-            atomical_id,
+            id: atomical_id,
             metadata: complex_metadata.clone(),
         };
 
@@ -353,7 +390,7 @@ mod tests {
         let atomical_id = AtomicalId { txid, vout: 0 };
 
         // Test seal operation
-        let seal_op = AtomicalOperation::Seal { atomical_id };
+        let seal_op = AtomicalOperation::Seal { id: atomical_id };
 
         assert!(seal_op.is_seal());
         assert!(!seal_op.is_mint());
@@ -364,7 +401,7 @@ mod tests {
         // Test sealing with different atomical IDs
         for vout in 0..5 {
             let id = AtomicalId { txid, vout };
-            let op = AtomicalOperation::Seal { atomical_id: id };
+            let op = AtomicalOperation::Seal { id };
             assert!(op.is_seal());
             assert_eq!(op.operation_type(), "seal");
         }
@@ -396,18 +433,19 @@ mod tests {
         // 创建所有类型的操作
         let operations = vec![
             AtomicalOperation::Mint {
+                atomical_id,
                 atomical_type: AtomicalType::NFT,
                 metadata: None,
             },
             AtomicalOperation::Transfer {
-                atomical_id,
+                id: atomical_id,
                 output_index: 0,
             },
             AtomicalOperation::Update {
-                atomical_id,
+                id: atomical_id,
                 metadata: json!({}),
             },
-            AtomicalOperation::Seal { atomical_id },
+            AtomicalOperation::Seal { id: atomical_id },
         ];
 
         // 验证每个操作的类型检查方法是互斥的

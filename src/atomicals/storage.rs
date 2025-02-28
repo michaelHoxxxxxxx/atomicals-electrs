@@ -1,10 +1,12 @@
-use std::path::Path;
 use std::sync::Arc;
+use std::path::Path;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use bitcoin::{TxOut, Txid};
-use electrs_rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use bitcoin::consensus::encode;
+use electrs_rocksdb::{DB, IteratorMode, Options, ColumnFamilyDescriptor};
 use serde::{Deserialize, Serialize};
 use hex;
 
@@ -34,14 +36,14 @@ impl AtomicalsStorage {
         // 创建列族
         let cf_opts = Options::default();
         let cf_descriptors = vec![
-            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_STATE, cf_opts.clone()),
-            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_OUTPUTS, cf_opts.clone()),
-            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
-            electrs_rocksdb::ColumnFamilyDescriptor::new(CF_INDEXES, cf_opts),
+            ColumnFamilyDescriptor::new(CF_STATE, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_OUTPUTS, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_METADATA, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_INDEXES, cf_opts),
         ];
         
         // 打开数据库
-        let db = electrs_rocksdb::DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)?;
+        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)?;
         
         Ok(Self { db: Arc::new(db) })
     }
@@ -123,7 +125,7 @@ impl AtomicalsStorage {
             .ok_or_else(|| anyhow!("Column family not found: {}", CF_METADATA))?;
         
         let mut results = Vec::new();
-        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
         
         for item in iter {
             let (key, value) = item?;
@@ -175,7 +177,7 @@ impl AtomicalsStorage {
     }
 
     /// 根据脚本获取 Atomicals
-    pub fn get_atomicals_by_script(&self, script: &[u8]) -> Result<Vec<AtomicalId>> {
+    pub fn get_script_atomicals(&self, script: &[u8]) -> Result<Vec<AtomicalOutput>> {
         let cf = self.db.cf_handle(CF_INDEXES)
             .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
         
@@ -183,14 +185,20 @@ impl AtomicalsStorage {
         
         if let Some(value) = self.db.get_cf(&cf, key.as_bytes())? {
             let atomicals: Vec<AtomicalId> = bincode::deserialize(&value)?;
-            Ok(atomicals)
+            let mut outputs = Vec::new();
+            for atomical_id in atomicals {
+                if let Some(output) = self.get_output(&atomical_id)? {
+                    outputs.push(output);
+                }
+            }
+            Ok(outputs)
         } else {
             Ok(Vec::new())
         }
     }
 
     /// 存储脚本与 Atomicals 的关系
-    pub fn store_script_atomicals(&self, script: &[u8], atomicals: &[AtomicalId]) -> Result<()> {
+    pub fn save_script_atomicals(&self, script: &[u8], atomicals: &[AtomicalId]) -> Result<()> {
         let cf = self.db.cf_handle(CF_INDEXES)
             .ok_or_else(|| anyhow!("Column family not found: {}", CF_INDEXES))?;
         

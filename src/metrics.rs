@@ -5,15 +5,16 @@ mod metrics_impl {
     #[cfg(feature = "metrics_process")]
     use prometheus::process_collector::ProcessCollector;
 
-    use prometheus::{self, Encoder, HistogramOpts, HistogramVec, Registry, TEXT_FORMAT};
+    use prometheus::{self, Encoder, HistogramOpts, HistogramVec, Registry, TEXT_FORMAT, Opts};
     use tiny_http::{Header as HttpHeader, Response, Server};
 
     use std::net::SocketAddr;
-
-    use crate::thread::spawn;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     pub struct Metrics {
-        reg: Registry,
+        reg: Arc<Registry>,
         pub mempool_count: prometheus::GaugeVec,
         pub mempool_vsize: prometheus::GaugeVec,
         pub mempool_pending_operations_count: prometheus::GaugeVec,
@@ -21,7 +22,7 @@ mod metrics_impl {
 
     impl Metrics {
         pub fn new(addr: SocketAddr) -> Result<Self> {
-            let reg = Registry::new();
+            let reg = Arc::new(Registry::new());
 
             #[cfg(feature = "metrics_process")]
             reg.register(Box::new(ProcessCollector::for_self()))
@@ -60,7 +61,7 @@ mod metrics_impl {
                 Err(err) => bail!("failed to start HTTP server on {}: {}", addr, err),
             };
 
-            spawn("metrics", move || {
+            thread::spawn(move || {
                 let content_type = HttpHeader::from_bytes(&b"Content-Type"[..], TEXT_FORMAT)
                     .expect("failed to create HTTP header for Prometheus text format");
                 for request in server.incoming_requests() {
@@ -72,11 +73,32 @@ mod metrics_impl {
                         .respond(Response::from_data(buffer).with_header(content_type.clone()))
                         .context("failed to send HTTP response")?;
                 }
-                Ok(())
+                Ok::<(), anyhow::Error>(())
             });
 
             info!("serving Prometheus metrics on {}", addr);
             Ok(result)
+        }
+
+        pub fn dummy() -> Self {
+            Self { 
+                reg: Arc::new(Registry::new()), 
+                mempool_count: prometheus::GaugeVec::new(
+                    Opts::new("mempool_count", "Total number of mempool transactions"),
+                    &["type"],
+                ).unwrap(),
+                mempool_vsize: prometheus::GaugeVec::new(
+                    Opts::new("mempool_vsize", "Total vsize of mempool transactions"),
+                    &["type"],
+                ).unwrap(),
+                mempool_pending_operations_count: prometheus::GaugeVec::new(
+                    Opts::new(
+                        "mempool_pending_operations_count",
+                        "Total number of pending operations in mempool",
+                    ),
+                    &["type"],
+                ).unwrap(),
+            }
         }
 
         pub fn histogram_vec(
@@ -98,6 +120,13 @@ mod metrics_impl {
         pub fn gauge(&self, name: &str, help: &str, label: &str) -> prometheus::GaugeVec {
             let opts = Opts::new(name, help);
             let gauge = prometheus::GaugeVec::new(opts, &[label]).unwrap();
+            self.reg.register(Box::new(gauge.clone())).unwrap();
+            gauge
+        }
+
+        pub fn gauge_vec(&self, name: &str, help: &str, labels: &[&str]) -> prometheus::GaugeVec {
+            let opts = Opts::new(name, help);
+            let gauge = prometheus::GaugeVec::new(opts, labels).unwrap();
             self.reg.register(Box::new(gauge.clone())).unwrap();
             gauge
         }
@@ -152,6 +181,13 @@ mod metrics_fake {
         }
 
         pub fn gauge(&self, _name: &str, _desc: &str, _label: &str) -> prometheus::GaugeVec {
+            prometheus::GaugeVec::new(
+                prometheus::Opts::new("dummy", "dummy"),
+                &["dummy"],
+            ).unwrap()
+        }
+
+        pub fn gauge_vec(&self, _name: &str, _desc: &str, _labels: &[&str]) -> prometheus::GaugeVec {
             prometheus::GaugeVec::new(
                 prometheus::Opts::new("dummy", "dummy"),
                 &["dummy"],

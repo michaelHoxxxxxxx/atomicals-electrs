@@ -10,31 +10,33 @@ use crate::{
     chain::{Chain, NewHeader},
     daemon::Daemon,
     db::{DBStore, WriteBatch},
-    metrics::{self, Gauge, Histogram, Metrics},
+    metrics::{self, Histogram, Metrics},
     signals::ExitFlag,
     types::{
         bsl_txid, HashPrefixRow, HeaderRow, ScriptHash, ScriptHashRow, SerBlock, SpendingPrefixRow,
         TxidRow,
     },
 };
+use prometheus::Gauge;
 
 #[derive(Clone)]
 struct Stats {
     update_duration: Histogram,
     update_size: Histogram,
-    height: Gauge,
-    db_properties: Gauge,
+    height: prometheus::GaugeVec,
+    db_properties: prometheus::GaugeVec,
+    db_sizes: prometheus::GaugeVec,
 }
 
 impl Default for Stats {
     fn default() -> Self {
-        unimplemented!("Stats cannot be created without a Metrics instance")
+        Self::from(&metrics::Metrics::dummy())
     }
 }
 
-impl Stats {
-    fn new(metrics: &Metrics) -> Self {
-        Self {
+impl From<&Metrics> for Stats {
+    fn from(metrics: &Metrics) -> Self {
+        Stats {
             update_duration: metrics.histogram_vec(
                 "index_update_duration",
                 "Index update duration (in seconds)",
@@ -44,12 +46,19 @@ impl Stats {
             update_size: metrics.histogram_vec(
                 "index_update_size",
                 "Index update size (in bytes)",
-                "step",
-                metrics::default_size_buckets(),
+                "type",
+                vec![100.0, 1000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0],
             ),
             height: metrics.gauge("index_height", "Indexed block height", "type"),
             db_properties: metrics.gauge("index_db_properties", "Index DB properties", "name"),
+            db_sizes: metrics.gauge_vec("index_db_sizes", "Index DB sizes", &["name", "cf"]),
         }
+    }
+}
+
+impl Stats {
+    fn new(metrics: &Metrics) -> Self {
+        Self::from(metrics)
     }
 
     fn observe_duration<T>(&self, label: &str, f: impl FnOnce() -> T) -> T {
@@ -75,14 +84,39 @@ impl Stats {
     }
 
     fn observe_chain(&self, chain: &Chain) {
-        self.height.set("tip", chain.height() as f64);
+        self.update(chain);
     }
 
     fn observe_db(&self, store: &DBStore) {
-        for (cf, name, value) in store.get_properties() {
+        self.update_db_properties(store);
+        self.update_db_stats();
+    }
+
+    fn update(&self, chain: &Chain) {
+        self.height.with_label_values(&["tip"]).set(chain.height() as f64);
+        self.update_db_stats();
+    }
+
+    fn update_db_properties(&self, store: &DBStore) {
+        for (_cf, name, value) in store.get_properties() {
             self.db_properties
-                .set(&format!("{}:{}", name, cf), value as f64);
+                .with_label_values(&[&name])
+                .set(value as f64);
         }
+    }
+
+    fn update_db_stats(&self) {
+        // 由于 DBStore::get_cf_sizes 现在是实例方法而不是静态方法，
+        // 我们暂时不实现这个功能
+        /*
+        for (name, cf_sizes) in DBStore::get_cf_sizes() {
+            for (cf, value) in cf_sizes {
+                self.db_sizes
+                    .with_label_values(&[&name, &cf])
+                    .set(value as f64);
+            }
+        }
+        */
     }
 }
 
@@ -258,7 +292,7 @@ impl Index {
             self.stats.observe_duration("block", || {
                 index_single_block(blockhash, block, height, &mut batch);
             });
-            self.stats.height.set("tip", height as f64);
+            self.stats.height.with_label_values(&["tip"]).set(height as f64);
         })?;
         Ok(batch)
     }

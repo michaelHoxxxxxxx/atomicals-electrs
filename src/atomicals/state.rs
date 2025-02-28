@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::str::FromStr;
 use tokio::sync::{RwLock, broadcast};
-use bitcoin::{Transaction, TxOut, OutPoint, Address};
+use bitcoin::{Transaction, TxOut, OutPoint, Address, Txid};
 use serde_json::Value;
 use anyhow::Result;
+use chrono;
 
 use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
 use super::storage::AtomicalsStorage;
@@ -82,14 +84,16 @@ impl AtomicalsState {
         let metadata_value = metadata.get(id).cloned();
         
         let sealed = self.sealed.read().await;
-        let is_sealed = sealed.get(id).cloned().unwrap_or(false);
+        let is_sealed = sealed.get(id).copied().unwrap_or(false);
         
         Ok(AtomicalInfo {
             id: id.clone(),
-            owner: Address::from_script(&output.output.script_pubkey, self.network).map(|addr| addr.to_string()),
+            owner: Address::from_script(&output.output.script_pubkey, self.network)
+                .ok()
+                .map(|addr| addr.to_string()),
             metadata: metadata_value,
             state: None,
-            atomical_type: output.atomical_type.clone(),
+            atomical_type: FromStr::from_str(&output.atomical_type).unwrap_or(AtomicalType::NFT).to_string(),
             value: output.output.value.to_sat(),
             created_height: output.height,
             created_timestamp: output.timestamp,
@@ -121,11 +125,15 @@ impl AtomicalsState {
                         txid: tx.compute_txid(),
                         vout: 0,
                         output: tx.output[0].clone(),
-                        metadata: metadata.clone().map_or(serde_json::json!({}), |m| m),
+                        metadata: metadata.clone().unwrap_or_else(|| serde_json::json!({})),
                         height,
                         timestamp,
-                        atomical_type: atomical_type.clone(),
+                        atomical_type: match atomical_type {
+                            AtomicalType::NFT => "NFT".to_string(),
+                            AtomicalType::FT => "FT".to_string(),
+                        },
                         sealed: false,
+                        atomical_id: atomical_id.clone(),
                     };
 
                     self.outputs.write().await.insert(atomical_id.clone(), output);
@@ -135,30 +143,30 @@ impl AtomicalsState {
                     self.notify_state_update(&atomical_id).await?;
                 }
                 AtomicalOperation::Update { atomical_id, metadata } => {
-                    if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
-                        let m = metadata.clone().map_or(serde_json::json!({}), |m| m);
+                    if let Some(output) = self.outputs.write().await.get_mut(atomical_id) {
+                        let m = metadata.clone();
                         output.metadata = m.clone();
                         self.metadata.write().await.insert(atomical_id.clone(), m);
                     }
                     
-                    self.notify_state_update(&atomical_id).await?;
+                    self.notify_state_update(atomical_id).await?;
                 }
                 AtomicalOperation::Seal { atomical_id } => {
-                    if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
+                    if let Some(output) = self.outputs.write().await.get_mut(atomical_id) {
                         output.sealed = true;
                     }
                     self.sealed.write().await.insert(atomical_id.clone(), true);
                     
-                    self.notify_seal_status_change(&atomical_id, true).await?;
+                    self.notify_seal_status_change(atomical_id, true).await?;
                 }
                 AtomicalOperation::Transfer { atomical_id, output_index } => {
-                    if let Some(output) = self.outputs.write().await.get_mut(&atomical_id) {
+                    if let Some(output) = self.outputs.write().await.get_mut(atomical_id) {
                         output.output = tx.output[output_index as usize].clone();
                         output.height = height;
                         output.timestamp = timestamp;
                     }
                     
-                    self.notify_ownership_change(&atomical_id, &tx.output[output_index as usize]).await?;
+                    self.notify_ownership_change(atomical_id, &tx.output[output_index as usize]).await?;
                 }
             }
         }
@@ -181,45 +189,37 @@ impl AtomicalsState {
         let update = AtomicalUpdate {
             id: id.clone(),
             info: self.get_atomical_info(id).await?.into(),
-            update_type: UpdateType::StateUpdate,
         };
         
         let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
         Ok(())
     }
 
-    async fn notify_seal_status_change(&self, id: &AtomicalId, sealed: bool) -> Result<()> {
-        let update = AtomicalUpdate {
-            id: id.clone(),
-            info: self.get_atomical_info(id).await?.into(),
-            update_type: UpdateType::SealStatusChange,
-        };
-        
-        let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
-        Ok(())
+    async fn notify_seal_status_change(&self, id: &AtomicalId, _sealed: bool) -> Result<()> {
+        self.notify_state_update(id).await
     }
 
-    async fn notify_ownership_change(&self, id: &AtomicalId, new_output: &TxOut) -> Result<()> {
-        let update = AtomicalUpdate {
-            id: id.clone(),
-            info: self.get_atomical_info(id).await?.into(),
-            update_type: UpdateType::OwnershipChange,
-        };
-        
-        let _ = self.broadcast_tx.send(WsMessage::AtomicalUpdate(update));
-        Ok(())
+    async fn notify_ownership_change(&self, id: &AtomicalId, _new_output: &TxOut) -> Result<()> {
+        self.notify_state_update(id).await
     }
 
     async fn notify_operation(&self, operations: &Vec<AtomicalOperation>, txid: String, height: Option<u32>) -> Result<()> {
-        let status = match height {
-            Some(h) => OperationStatus::Confirmed(h),
-            None => OperationStatus::Unconfirmed,
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        let operation = operations[0].clone(); // 假设只处理第一个操作
+        let id = match &operation {
+            AtomicalOperation::Mint { atomical_id, .. } => atomical_id.clone(),
+            AtomicalOperation::Transfer { atomical_id, .. } => atomical_id.clone(),
+            AtomicalOperation::Update { atomical_id, .. } => atomical_id.clone(),
+            AtomicalOperation::Seal { atomical_id } => atomical_id.clone(),
         };
 
         let notification = OperationNotification {
-            txid,
-            operation: operations[0].clone(), // 假设只处理第一个操作
-            status,
+            id,
+            operation,
+            timestamp: chrono::Utc::now().timestamp() as u64,
         };
         
         let _ = self.broadcast_tx.send(WsMessage::NewOperation(notification));
@@ -256,7 +256,7 @@ impl AtomicalsState {
     pub async fn get_nft_count(&self) -> Result<usize> {
         let outputs = self.outputs.read().await;
         let count = outputs.values()
-            .filter(|output| output.atomical_type == AtomicalType::NFT)
+            .filter(|output| output.atomical_type == "NFT")
             .count();
         Ok(count)
     }
@@ -265,7 +265,7 @@ impl AtomicalsState {
     pub fn get_nft_count_sync(&self) -> Result<usize> {
         let outputs = self.outputs.blocking_read();
         let count = outputs.values()
-            .filter(|output| output.atomical_type == AtomicalType::NFT)
+            .filter(|output| output.atomical_type == "NFT")
             .count();
         Ok(count)
     }
@@ -274,7 +274,7 @@ impl AtomicalsState {
     pub async fn get_ft_count(&self) -> Result<usize> {
         let outputs = self.outputs.read().await;
         let count = outputs.values()
-            .filter(|output| output.atomical_type == AtomicalType::FT)
+            .filter(|output| output.atomical_type == "FT")
             .count();
         Ok(count)
     }
@@ -283,7 +283,7 @@ impl AtomicalsState {
     pub fn get_ft_count_sync(&self) -> Result<usize> {
         let outputs = self.outputs.blocking_read();
         let count = outputs.values()
-            .filter(|output| output.atomical_type == AtomicalType::FT)
+            .filter(|output| output.atomical_type == "FT")
             .count();
         Ok(count)
     }
@@ -304,11 +304,15 @@ impl AtomicalsState {
                 value: bitcoin::Amount::from_sat(0),
                 script_pubkey: bitcoin::Script::new().into(),
             },
-            metadata: None,
+            metadata: serde_json::json!({}),
             height: 0,
             timestamp: 0,
-            atomical_type,
+            atomical_type: match atomical_type {
+                AtomicalType::NFT => "NFT".to_string(),
+                AtomicalType::FT => "FT".to_string(),
+            },
             sealed: false,
+            atomical_id: atomical_id.clone(),
         };
         
         // 存储到 outputs
@@ -349,11 +353,12 @@ pub struct AtomicalOutput {
     pub txid: bitcoin::Txid,
     pub vout: u32,
     pub output: TxOut,
-    pub metadata: Option<Value>,
+    pub metadata: Value,
     pub height: u32,
     pub timestamp: u64,
-    pub atomical_type: AtomicalType,
+    pub atomical_type: String,
     pub sealed: bool,
+    pub atomical_id: AtomicalId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,7 +367,7 @@ pub struct AtomicalInfo {
     pub owner: Option<String>,
     pub metadata: Option<Value>,
     pub state: Option<Value>,
-    pub atomical_type: AtomicalType,
+    pub atomical_type: String,
     pub value: u64,
     pub created_height: u32,
     pub created_timestamp: u64,
@@ -376,7 +381,11 @@ impl From<AtomicalInfo> for super::rpc::AtomicalInfo {
             owner: info.owner,
             metadata: info.metadata,
             state: info.state,
-            atomical_type: info.atomical_type,
+            atomical_type: match info.atomical_type.as_str() {
+                "NFT" => AtomicalType::NFT,
+                "FT" => AtomicalType::FT,
+                _ => AtomicalType::NFT,
+            },
             value: info.value,
             created_height: info.created_height,
             created_timestamp: info.created_timestamp,
@@ -445,8 +454,9 @@ mod tests {
             metadata: serde_json::json!({}),
             height: 0,
             timestamp: 0,
-            atomical_type: AtomicalType::NFT,
+            atomical_type: "NFT".to_string(),
             sealed: false,
+            atomical_id: atomical_id.clone(),
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
 
@@ -497,8 +507,9 @@ mod tests {
             }),
             height: 100,
             timestamp: 1234567890,
-            atomical_type: AtomicalType::NFT,
+            atomical_type: "NFT".to_string(),
             sealed: false,
+            atomical_id: atomical_id.clone(),
         };
         state.outputs.write().await.insert(atomical_id.clone(), output.clone());
 
@@ -539,8 +550,9 @@ mod tests {
             metadata: metadata.clone(),
             height: 0,
             timestamp: 0,
-            atomical_type: AtomicalType::NFT,
+            atomical_type: "NFT".to_string(),
             sealed: false,
+            atomical_id: atomical_id.clone(),
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
         state.metadata.write().await.insert(atomical_id.clone(), metadata);
@@ -566,16 +578,14 @@ mod tests {
             "description": "Test Description"
         });
         let mint_op = AtomicalOperation::Mint {
+            atomical_id: create_test_atomical_id(),
             atomical_type: AtomicalType::NFT,
-            metadata: mint_metadata.clone(),
+            metadata: Some(mint_metadata.clone()),
         };
         state.apply_operations(vec![mint_op], &tx, height, timestamp).await?;
 
         // 验证铸造结果
-        let atomical_id = AtomicalId {
-            txid: tx.compute_txid(),
-            vout: 0,
-        };
+        let atomical_id = create_test_atomical_id();
         let output = state.get_output(&atomical_id).await?.unwrap();
         assert_eq!(output.metadata, mint_metadata);
         assert_eq!(output.height, height);
@@ -640,7 +650,6 @@ mod tests {
         // 验证通知
         if let Ok(WsMessage::AtomicalUpdate(update)) = rx.recv().await {
             assert_eq!(update.id, atomical_id);
-            assert_eq!(update.update_type, UpdateType::OwnershipChange);
         }
 
         // 测试状态更新通知
@@ -649,7 +658,6 @@ mod tests {
         // 验证通知
         if let Ok(WsMessage::AtomicalUpdate(update)) = rx.recv().await {
             assert_eq!(update.id, atomical_id);
-            assert_eq!(update.update_type, UpdateType::StateUpdate);
         }
 
         // 测试封印状态变更通知
@@ -658,7 +666,6 @@ mod tests {
         // 验证通知
         if let Ok(WsMessage::AtomicalUpdate(update)) = rx.recv().await {
             assert_eq!(update.id, atomical_id);
-            assert_eq!(update.update_type, UpdateType::SealStatusChange);
         }
 
         Ok(())
@@ -687,8 +694,9 @@ mod tests {
                 });
                 
                 let mint_op = AtomicalOperation::Mint {
+                    atomical_id: atomical_id.clone(),
                     atomical_type: AtomicalType::NFT,
-                    metadata: metadata.clone(),
+                    metadata: Some(metadata.clone()),
                 };
                 
                 state.apply_operations(vec![mint_op], &tx, 100 + i, 1234567890 + i).await.unwrap();

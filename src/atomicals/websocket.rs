@@ -14,6 +14,9 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use bytes::Bytes;
 use flate2::Compression;
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
+use std::io::{Write, Read};
 
 use crate::atomicals::state::AtomicalsState;
 use crate::atomicals::protocol::{AtomicalId, AtomicalOperation};
@@ -137,6 +140,28 @@ pub struct OperationNotification {
     pub id: AtomicalId,
     pub operation: AtomicalOperation,
     pub timestamp: u64,
+}
+
+/// 更新类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpdateType {
+    /// 新创建
+    New,
+    /// 更新
+    Update,
+    /// 删除
+    Delete,
+}
+
+/// 操作状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OperationStatus {
+    /// 成功
+    Success,
+    /// 失败
+    Failure,
+    /// 待处理
+    Pending,
 }
 
 /// 心跳消息
@@ -296,15 +321,12 @@ impl MessageHandler {
         Ok(Bytes::from(compressed))
     }
 
-    /// 解压消息
-    fn decompress(&self, data: &[u8]) -> Result<Bytes> {
-        // 尝试解压，如果失败则返回原始数据
+    /// 解压缩数据
+    fn decompress_data(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut decoder = GzDecoder::new(data);
         let mut decompressed = Vec::new();
-        match decoder.read_to_end(&mut decompressed) {
-            Ok(_) => Ok(Bytes::from(decompressed)),
-            Err(_) => Ok(Bytes::copy_from_slice(data)),
-        }
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(decompressed)
     }
 
     /// 处理发送消息
@@ -326,11 +348,11 @@ impl MessageHandler {
     fn handle_incoming(&self, msg: Message) -> Result<Message> {
         match msg {
             Message::Binary(data) => {
-                let decompressed = self.decompress(&data)?;
+                let decompressed = self.decompress_data(&data)?;
                 // 尝试将解压后的数据转换为文本
-                match String::from_utf8(decompressed.to_vec()) {
+                match String::from_utf8(decompressed.clone()) {
                     Ok(text) => Ok(Message::Text(text)),
-                    Err(_) => Ok(Message::Binary(decompressed.to_vec())),
+                    Err(_) => Ok(Message::Binary(decompressed)),
                 }
             }
             _ => Ok(msg),
@@ -380,18 +402,22 @@ impl WsServer {
             .and(warp::ws())
             .and(warp::addr::remote())
             .map(move |ws: Ws, addr: Option<std::net::SocketAddr>| {
-                let ws_server = ws_server.clone();
                 let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
+                let ws_server_clone = ws_server.clone();
                 
-                ws.on_upgrade(move |websocket| async move {
-                    ws_server.handle_connection(ws_server.clone(), websocket, ip).await;
+                ws.on_upgrade(move |websocket| {
+                    let ws_server = ws_server_clone.clone();
+                    let ip_clone = ip.clone();
+                    async move {
+                        ws_server.handle_connection(websocket, ip_clone).await;
+                    }
                 })
             });
         
         // 启动心跳检查任务
         let heartbeat_server = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_server.websocket_config.heartbeat_interval);
+            let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_server.websocket_config.heartbeat_interval));
             loop {
                 interval.tick().await;
                 if let Err(e) = heartbeat_server.check_heartbeats().await {
@@ -403,7 +429,7 @@ impl WsServer {
         // 启动连接清理任务
         let cleanup_server = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_server.websocket_config.cleanup_interval);
+            let mut interval = tokio::time::interval(Duration::from_secs(cleanup_server.websocket_config.cleanup_interval));
             loop {
                 interval.tick().await;
                 if let Err(e) = cleanup_server.cleanup_connections().await {
@@ -413,7 +439,7 @@ impl WsServer {
         });
         
         // 启动服务器
-        let addr = ([0, 0, 0, 0], self.websocket_config.port).into();
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.websocket_config.port));
         info!("WebSocket server listening on {}", addr);
         warp::serve(ws_route).run(addr).await;
         
@@ -421,7 +447,7 @@ impl WsServer {
     }
 
     /// 处理新的 WebSocket 连接
-    pub async fn handle_connection(self: Arc<Self>, websocket: WebSocket, ip: String) {
+    pub async fn handle_connection(&self, websocket: WebSocket, _ip: String) {
         let (mut ws_tx, mut ws_rx) = websocket.split();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let connection_id = Uuid::new_v4().to_string();
@@ -441,9 +467,29 @@ impl WsServer {
         let handle_messages = async move {
             while let Some(result) = ws_rx.next().await {
                 match result {
-                    Ok(msg) => {
+                    Ok(warp_msg) => {
+                        // 将 warp::ws::Message 转换为 tokio_tungstenite::tungstenite::Message
+                        let tungstenite_msg = if warp_msg.is_text() {
+                            if let Ok(text) = warp_msg.to_str() {
+                                Message::Text(text.to_string())
+                            } else {
+                                Message::Binary(warp_msg.as_bytes().to_vec())
+                            }
+                        } else if warp_msg.is_binary() {
+                            Message::Binary(warp_msg.as_bytes().to_vec())
+                        } else if warp_msg.is_ping() {
+                            Message::Ping(warp_msg.as_bytes().to_vec())
+                        } else if warp_msg.is_pong() {
+                            Message::Pong(warp_msg.as_bytes().to_vec())
+                        } else if warp_msg.is_close() {
+                            Message::Close(None)
+                        } else {
+                            // 默认作为二进制消息处理
+                            Message::Binary(warp_msg.as_bytes().to_vec())
+                        };
+                        
                         // 处理消息
-                        if let Err(e) = ws_server.handle_message(msg, &connection_id).await {
+                        if let Err(e) = ws_server.handle_message(tungstenite_msg, &connection_id).await {
                             error!("Error handling message: {}", e);
                             if let Err(e) = ws_server.broadcast(WsMessage::Error(e.to_string())).await {
                                 error!("Failed to broadcast error: {}", e);
@@ -465,7 +511,26 @@ impl WsServer {
         // 转发消息到客户端
         let forward_messages = async move {
             while let Some(msg) = rx.next().await {
-                if let Err(e) = ws_tx.send(msg).await {
+                // 将 tokio_tungstenite::tungstenite::Message 转换为 warp::ws::Message
+                let warp_msg = match msg {
+                    Message::Text(text) => WarpMessage::text(text),
+                    Message::Binary(data) => WarpMessage::binary(data),
+                    Message::Ping(data) => WarpMessage::ping(data),
+                    Message::Pong(data) => WarpMessage::pong(data),
+                    Message::Close(frame) => {
+                        if let Some(frame) = frame {
+                            WarpMessage::close_with(frame.code, frame.reason)
+                        } else {
+                            WarpMessage::close()
+                        }
+                    },
+                    Message::Frame(_) => {
+                        // 忽略 Frame 消息
+                        continue;
+                    }
+                };
+                
+                if let Err(e) = ws_tx.send(warp_msg).await {
                     error!("Failed to send message: {}", e);
                     break;
                 }
@@ -502,9 +567,9 @@ impl WsServer {
         drop(connections);
 
         for id in to_remove {
-            if let Some(conn) = self.connections.write().await.remove(&id) {
+            if let Some(_conn) = self.connections.write().await.remove(&id) {
                 self.connection_count.fetch_sub(1, Ordering::SeqCst);
-                self.metrics.record_disconnect();
+                self.metrics.record_disconnection();
                 info!("Connection {} timed out", id);
             }
         }
@@ -526,9 +591,9 @@ impl WsServer {
         drop(connections);
 
         for id in to_remove {
-            if let Some(conn) = self.connections.write().await.remove(&id) {
+            if let Some(_conn) = self.connections.write().await.remove(&id) {
                 self.connection_count.fetch_sub(1, Ordering::SeqCst);
-                self.metrics.record_disconnect();
+                self.metrics.record_disconnection();
                 info!("Connection {} removed due to inactivity", id);
             }
         }
@@ -543,7 +608,7 @@ impl WsServer {
         match req.subscription_type {
             SubscriptionType::Atomical(id) => {
                 // 验证 Atomical 是否存在
-                if !self.state.exists(&id).await? {
+                if !self.state.exists(&id)? {
                     return Err(anyhow!("Atomical not found"));
                 }
             }
@@ -664,6 +729,10 @@ impl WsServer {
             }
             Message::Close(_) => {
                 return Ok(());
+            }
+            Message::Frame(_) => {
+                // 忽略 Frame 消息
+                debug!("Ignoring Frame message");
             }
         }
         Ok(())

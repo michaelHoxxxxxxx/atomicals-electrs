@@ -8,11 +8,12 @@ use parking_lot::RwLock;
 
 use crate::{
     daemon::Daemon,
-    metrics::{Gauge, Metrics, Counter},
+    metrics::Metrics,
     signals::ExitFlag,
     types::ScriptHash,
     atomicals::{AtomicalsState, AtomicalOperation},
 };
+use prometheus::{GaugeVec, Counter};
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -31,9 +32,9 @@ pub struct Mempool {
     by_funding: HashSet<(ScriptHash, Txid)>,
     by_spending: HashSet<(OutPoint, Txid)>,
     // stats
-    vsize: Gauge,
-    count: Gauge,
-    pending_operations_count: Gauge,
+    vsize: GaugeVec,
+    count: GaugeVec,
+    pending_operations_count: GaugeVec,
     atomicals: Arc<AtomicalsState>,
     pending_operations: RwLock<HashMap<Txid, Vec<AtomicalOperation>>>,
     fee_histogram: FeeHistogram,
@@ -53,20 +54,20 @@ impl Mempool {
             entries: Default::default(),
             by_funding: Default::default(),
             by_spending: Default::default(),
-            vsize: metrics.gauge(
+            vsize: metrics.gauge_vec(
                 "mempool_txs_vsize",
                 "Total vsize of mempool transactions (in bytes)",
-                "fee_rate",
+                &["fee_rate"],
             ),
-            count: metrics.gauge(
+            count: metrics.gauge_vec(
                 "mempool_txs_count",
                 "Total number of mempool transactions",
-                "fee_rate",
+                &["fee_rate"],
             ),
-            pending_operations_count: metrics.gauge(
+            pending_operations_count: metrics.gauge_vec(
                 "mempool_pending_operations_count",
                 "Total number of pending operations in mempool",
-                "fee_rate",
+                &["fee_rate"],
             ),
             atomicals,
             pending_operations: RwLock::new(HashMap::new()),
@@ -139,13 +140,17 @@ impl Mempool {
                         };
 
                         self.entries.insert(txid, entry);
-                        self.count.inc();
+                        self.count.with_label_values(&["total"]).inc();
 
                         // Process Atomicals operations
                         if let Ok(operations) = self.atomicals.get_atomical_operations(&tx).await {
                             if !operations.is_empty() {
-                                self.pending_operations.write().insert(txid, operations);
-                                self.pending_operations_count.inc();
+                                if let Some(entry) = self.pending_operations.write().get_mut(&txid) {
+                                    entry.extend(operations);
+                                } else {
+                                    self.pending_operations.write().insert(txid, operations);
+                                    self.pending_operations_count.with_label_values(&["total"]).inc();
+                                }
                             }
                         }
                     } else {

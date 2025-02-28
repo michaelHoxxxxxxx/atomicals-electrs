@@ -97,12 +97,12 @@ impl AtomicalsRpc {
         let script = addr.script_pubkey();
 
         // 查询地址拥有的 Atomicals
-        let atomicals = self.storage.get_atomicals_by_script(&script.as_bytes())?;
-
+        let outputs = self.storage.get_script_atomicals(&script.as_bytes())?;
+        
         // 获取每个 Atomical 的详细信息
         let mut result = Vec::new();
-        for id in atomicals {
-            if let Ok(info) = self.get_atomical_info(&id) {
+        for output in outputs {
+            if let Ok(info) = self.get_atomical_info(&output.atomical_id) {
                 result.push(info);
             }
         }
