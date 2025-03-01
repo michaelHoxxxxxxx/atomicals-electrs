@@ -6,7 +6,8 @@ use std::{
     collections::hash_map::HashMap,
     io::{BufRead, BufReader, Write},
     iter::once,
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream, SocketAddr},
+    sync::Arc,
 };
 
 use crate::{
@@ -90,7 +91,12 @@ fn serve() -> Result<()> {
     loop {
         // initial sync and compaction may take a few hours
         while server_rx.is_empty() {
-            let done = duration.observe_duration("sync", || rpc.sync().context("sync failed"))?; // sync a batch of blocks
+            // 创建一个运行时来执行异步操作
+            let runtime = tokio::runtime::Runtime::new()?;
+            let sync_result = runtime.block_on(async {
+                rpc.sync().await
+            });
+            let done = duration.observe_duration("sync", || sync_result.context("sync failed"))?; // sync a batch of blocks
             peers = duration.observe_duration("notify", || notify_peers(&rpc, peers)); // peers are disconnected on error
             if !done {
                 continue; // more blocks to sync
@@ -105,7 +111,9 @@ fn serve() -> Result<()> {
                 // Handle signals for graceful shutdown
                 recv(rpc.signal().receiver()) -> result => {
                     result.context("signal channel disconnected")?;
-                    rpc.signal().exit_flag().poll().context("RPC server interrupted")?;
+                    if rpc.signal().exit_flag().is_set() {
+                        return Err(anyhow::anyhow!("RPC server interrupted"));
+                    }
                 },
                 // Handle new blocks' notifications
                 recv(new_block_rx) -> result => match result {
@@ -248,12 +256,12 @@ fn recv_loop(peer_id: usize, stream: &TcpStream, server_tx: Sender<Event>) -> Re
     Ok(())
 }
 
-use anyhow::Result;
-use std::sync::Arc;
-
-use crate::atomicals::{AtomicalsState, WsServer};
-use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::atomicals::{
+    AtomicalsState, 
+    AtomicalsStorage,
+    TxParser,
+    websocket::{WsServer, WebSocketConfig}
+};
 
 pub struct Server {
     config: Config,
@@ -264,9 +272,33 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config) -> Result<Self> {
-        let metrics = Arc::new(Metrics::new()?);
-        let atomicals_state = Arc::new(AtomicalsState::new()?);
-        let ws_server = Arc::new(WsServer::new(atomicals_state.clone()));
+        // 创建 Metrics
+        let metrics = Arc::new(Metrics::new(
+            config.monitoring_addr
+        )?);
+        
+        // 创建 AtomicalsStorage
+        let storage = Arc::new(AtomicalsStorage::new(&config.db_dir)?);
+        
+        // 创建 TxParser
+        let tx_parser = TxParser::new();
+        
+        // 创建 AtomicalsState - 注意这是异步函数，所以我们需要在同步上下文中处理
+        let runtime = tokio::runtime::Runtime::new()?;
+        let atomicals_state = Arc::new(runtime.block_on(async {
+            AtomicalsState::new(config.network, Arc::clone(&storage), tx_parser).await
+        })?);
+        
+        // 创建 WebSocketConfig
+        let ws_config = WebSocketConfig {
+            max_connections: config.websocket_max_connections.unwrap_or(1000),
+            heartbeat_interval: config.websocket_heartbeat_interval.unwrap_or(30),
+            port: config.websocket_port.unwrap_or(8080),
+            ..WebSocketConfig::default()
+        };
+        
+        // 创建 WsServer
+        let ws_server = Arc::new(WsServer::new(atomicals_state.clone(), ws_config));
 
         Ok(Self {
             config,
@@ -278,10 +310,9 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         // 启动 WebSocket 服务器
-        let ws_port = self.config.websocket_port.unwrap_or(8080);
         let ws_server = self.ws_server.clone();
         tokio::spawn(async move {
-            if let Err(e) = ws_server.start(ws_port).await {
+            if let Err(e) = ws_server.start_server().await {
                 error!("WebSocket server error: {}", e);
             }
         });

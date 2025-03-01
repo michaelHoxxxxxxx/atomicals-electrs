@@ -36,6 +36,8 @@ pub enum AtomicalType {
     Container,
     /// Realm
     Realm,
+    /// Unknown type
+    Unknown,
 }
 
 impl fmt::Display for AtomicalType {
@@ -46,6 +48,7 @@ impl fmt::Display for AtomicalType {
             AtomicalType::DID => write!(f, "DID"),
             AtomicalType::Container => write!(f, "Container"),
             AtomicalType::Realm => write!(f, "Realm"),
+            AtomicalType::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -60,6 +63,7 @@ impl FromStr for AtomicalType {
             "DID" => Ok(AtomicalType::DID),
             "Container" => Ok(AtomicalType::Container),
             "Realm" => Ok(AtomicalType::Realm),
+            "Unknown" => Ok(AtomicalType::Unknown),
             _ => Err(format!("Unknown AtomicalType: {}", s)),
         }
     }
@@ -71,7 +75,7 @@ pub enum AtomicalOperation {
     /// Mint a new Atomical
     Mint {
         /// ID of the Atomical being minted
-        atomical_id: AtomicalId,
+        id: AtomicalId,
         /// Type of Atomical being minted
         atomical_type: AtomicalType,
         /// Optional metadata for the Atomical
@@ -202,6 +206,11 @@ mod tests {
         assert_ne!(AtomicalType::DID, AtomicalType::Container);
         assert_ne!(AtomicalType::DID, AtomicalType::Realm);
         assert_ne!(AtomicalType::Container, AtomicalType::Realm);
+        assert_ne!(AtomicalType::NFT, AtomicalType::Unknown);
+        assert_ne!(AtomicalType::FT, AtomicalType::Unknown);
+        assert_ne!(AtomicalType::DID, AtomicalType::Unknown);
+        assert_ne!(AtomicalType::Container, AtomicalType::Unknown);
+        assert_ne!(AtomicalType::Realm, AtomicalType::Unknown);
 
         // Test equality with same type
         assert_eq!(AtomicalType::NFT, AtomicalType::NFT);
@@ -209,6 +218,7 @@ mod tests {
         assert_eq!(AtomicalType::DID, AtomicalType::DID);
         assert_eq!(AtomicalType::Container, AtomicalType::Container);
         assert_eq!(AtomicalType::Realm, AtomicalType::Realm);
+        assert_eq!(AtomicalType::Unknown, AtomicalType::Unknown);
 
         // Test serialization/deserialization for all types
         let types = vec![
@@ -217,6 +227,7 @@ mod tests {
             AtomicalType::DID,
             AtomicalType::Container,
             AtomicalType::Realm,
+            AtomicalType::Unknown,
         ];
 
         for atomical_type in types {
@@ -249,7 +260,7 @@ mod tests {
         let atomical_id = AtomicalId { txid, vout: 0 };
 
         let mint_op = AtomicalOperation::Mint {
-            atomical_id,
+            id: atomical_id,
             atomical_type: AtomicalType::NFT,
             metadata: Some(metadata.clone()),
         };
@@ -262,7 +273,7 @@ mod tests {
 
         // Test mint operation without metadata
         let mint_op_no_metadata = AtomicalOperation::Mint {
-            atomical_id,
+            id: atomical_id,
             atomical_type: AtomicalType::FT,
             metadata: None,
         };
@@ -277,9 +288,10 @@ mod tests {
             AtomicalType::DID,
             AtomicalType::Container,
             AtomicalType::Realm,
+            AtomicalType::Unknown,
         ] {
             let op = AtomicalOperation::Mint {
-                atomical_id,
+                id: atomical_id,
                 atomical_type,
                 metadata: Some(json!({"name": format!("Test {:#?}", atomical_type)})),
             };
@@ -433,7 +445,7 @@ mod tests {
         // 创建所有类型的操作
         let operations = vec![
             AtomicalOperation::Mint {
-                atomical_id,
+                id: atomical_id,
                 atomical_type: AtomicalType::NFT,
                 metadata: None,
             },

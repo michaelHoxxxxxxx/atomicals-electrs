@@ -6,30 +6,32 @@ extern crate anyhow;
 extern crate serde_derive;
 
 pub mod atomicals {
-    mod protocol;
-    mod state;
-    mod storage;
-    mod tx_parser;
-    mod validation;
-    mod rpc;
-    mod websocket;
-    mod indexer;
-    mod metrics;
-    mod util;
+    pub mod protocol;
+    pub mod state;
+    pub mod storage;
+    pub mod tx_parser;
+    pub mod validation;
+    pub mod rpc;
+    pub mod websocket;
+    pub mod indexer;
+    pub mod metrics;
+    pub mod util;
 
     pub use protocol::{AtomicalId, AtomicalOperation, AtomicalType};
     pub use state::{AtomicalsState, AtomicalOutput};
     pub use storage::AtomicalsStorage;
     pub use rpc::AtomicalsRpc;
-    pub use websocket::{WsServer, WsMessage, SubscriptionType, SubscribeRequest};
+    pub use websocket::{WsServer, WsMessage, SubscriptionType, SubscribeRequest, WebSocketConfig};
     pub use indexer::AtomicalsIndexer;
     pub use validation::AtomicalsValidator;
+    pub use tx_parser::TxParser;
 }
 
 pub mod chain;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod electrum;
 pub mod index;
 pub mod mempool;
 pub mod metrics;
@@ -41,6 +43,7 @@ pub mod signals;
 pub mod thread;
 pub mod tracker;
 pub mod types;
+pub mod server;
 
 pub use crate::chain::Chain;
 pub use crate::config::Config;
@@ -63,3 +66,4 @@ pub use atomicals::{
 
 pub use signals::ExitFlag;
 pub use types::ScriptHash;
+pub use crate::server::run;

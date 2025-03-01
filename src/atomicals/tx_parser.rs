@@ -23,6 +23,10 @@ fn parse_output(output: &TxOut, _vout: u32) -> Option<AtomicalOperation> {
             // 解析铸造操作
             let metadata = serde_json::from_slice(&script[ATOMICALS_PREFIX.len() + 4..]).ok()?;
             Some(AtomicalOperation::Mint {
+                id: AtomicalId {
+                    txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+                    vout: 0,
+                },
                 atomical_type: AtomicalType::NFT,
                 metadata,
             })
@@ -35,7 +39,7 @@ fn parse_output(output: &TxOut, _vout: u32) -> Option<AtomicalOperation> {
             };
             let metadata = serde_json::from_slice(&script[42..]).ok()?;
             Some(AtomicalOperation::Update {
-                atomical_id,
+                id: atomical_id,
                 metadata,
             })
         }
@@ -46,7 +50,7 @@ fn parse_output(output: &TxOut, _vout: u32) -> Option<AtomicalOperation> {
                 vout: u32::from_be_bytes(script[36..40].try_into().ok()?),
             };
             Some(AtomicalOperation::Seal {
-                atomical_id,
+                id: atomical_id,
             })
         }
         "transfer" => {
@@ -57,7 +61,7 @@ fn parse_output(output: &TxOut, _vout: u32) -> Option<AtomicalOperation> {
             };
             let output_index = u32::from_be_bytes(script[44..48].try_into().ok()?);
             Some(AtomicalOperation::Transfer {
-                atomical_id,
+                id: atomical_id,
                 output_index,
             })
         }
@@ -141,7 +145,7 @@ mod tests {
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
-            AtomicalOperation::Mint { atomical_type, metadata: parsed_metadata } => {
+            AtomicalOperation::Mint { id, atomical_type, metadata: parsed_metadata } => {
                 assert_eq!(*atomical_type, AtomicalType::NFT);
                 assert_eq!(parsed_metadata["name"], "Test NFT");
                 assert_eq!(parsed_metadata["description"], "A test NFT");
@@ -181,7 +185,7 @@ mod tests {
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
-            AtomicalOperation::Update { atomical_id: parsed_id, metadata: parsed_metadata } => {
+            AtomicalOperation::Update { id: parsed_id, metadata: parsed_metadata } => {
                 assert_eq!(*parsed_id, atomical_id);
                 assert_eq!(parsed_metadata["updated"], true);
             }
@@ -216,7 +220,7 @@ mod tests {
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
-            AtomicalOperation::Seal { atomical_id: parsed_id } => {
+            AtomicalOperation::Seal { id: parsed_id } => {
                 assert_eq!(*parsed_id, atomical_id);
             }
             _ => panic!("Expected Seal operation"),
@@ -252,7 +256,7 @@ mod tests {
         assert_eq!(operations.len(), 1);
         
         match &operations[0] {
-            AtomicalOperation::Transfer { atomical_id: parsed_id, output_index: parsed_index } => {
+            AtomicalOperation::Transfer { id: parsed_id, output_index: parsed_index } => {
                 assert_eq!(*parsed_id, atomical_id);
                 assert_eq!(*parsed_index, output_index);
             }
@@ -417,7 +421,7 @@ mod tests {
 
         // 验证零值输出的操作
         let has_zero_value_transfer = operations.iter().any(|op| {
-            matches!(op, AtomicalOperation::Transfer { atomical_id: id, output_index } if *id == atomical_id && *output_index == 0)
+            matches!(op, AtomicalOperation::Transfer { id: id, output_index } if *id == atomical_id && *output_index == 0)
         });
         assert!(has_zero_value_transfer);
     }

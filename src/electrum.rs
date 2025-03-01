@@ -2,26 +2,30 @@ use anyhow::{bail, Context, Result};
 use bitcoin::{
     consensus::{deserialize, encode::serialize_hex},
     hashes::hex::FromHex,
-    hex::DisplayHex,
     BlockHash, Txid,
 };
 use crossbeam_channel::Receiver;
 use rayon::prelude::*;
-use serde_derive::Deserialize;
 use serde_json::{self, json, Value};
-
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
-use std::iter::FromIterator;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
+    atomicals::{
+        AtomicalsState, 
+        AtomicalsStorage,
+        TxParser,
+    },
     cache::Cache,
+    chain::Chain,
     config::{Config, ELECTRS_VERSION},
-    daemon::{self, extract_bitcoind_error, Daemon},
+    daemon::{self, Daemon, extract_bitcoind_error},
     merkle::Proof,
     metrics::{self, Histogram, Metrics},
-    signals::Signal,
+    signals::{ExitFlag, Signal},
     status::ScriptHashStatus,
     tracker::Tracker,
     types::ScriptHash,
@@ -46,6 +50,18 @@ struct Request {
 
     #[serde(default)]
     params: Value,
+}
+
+impl Request {
+    fn response(self, result: Result<Value>) -> Value {
+        match result {
+            Ok(result) => Response::new(self.id, result),
+            Err(e) => {
+                warn!("rpc #{} {} failed: {}", self.id, self.method, e);
+                Response::error(e)
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -78,43 +94,56 @@ impl From<&TxGetArgs> for (Txid, bool) {
     }
 }
 
-enum StandardError {
+#[derive(Debug)]
+enum RpcError {
     ParseError,
     InvalidRequest,
     MethodNotFound,
     InvalidParams,
-}
-
-enum RpcError {
-    // JSON-RPC spec errors
-    Standard(StandardError),
-    // Electrum-specific errors
-    BadRequest(anyhow::Error),
-    DaemonError(daemon::RpcError),
+    InternalError,
     UnavailableIndex,
+    DaemonError(daemon::RpcError),
+    BadRequest(anyhow::Error),
 }
 
 impl RpcError {
-    fn to_value(&self) -> Value {
-        match self {
-            RpcError::Standard(err) => match err {
-                StandardError::ParseError => json!({"code": -32700, "message": "parse error"}),
-                StandardError::InvalidRequest => {
-                    json!({"code": -32600, "message": "invalid request"})
-                }
-                StandardError::MethodNotFound => {
-                    json!({"code": -32601, "message": "method not found"})
-                }
-                StandardError::InvalidParams => {
-                    json!({"code": -32602, "message": "invalid params"})
-                }
-            },
-            RpcError::BadRequest(err) => json!({"code": 1, "message": err.to_string()}),
-            RpcError::DaemonError(err) => json!({"code": 2, "message": err.message}),
-            RpcError::UnavailableIndex => {
-                // Internal JSON-RPC error (https://www.jsonrpc.org/specification#error_object)
-                json!({"code": -32603, "message": "unavailable index"})
+    fn code(&self) -> i32 {
+        match *self {
+            // JSON-RPC 2.0 error codes
+            RpcError::ParseError => -32700,
+            RpcError::InvalidRequest => -32600,
+            RpcError::MethodNotFound => -32601,
+            RpcError::InvalidParams => -32602,
+            RpcError::InternalError => -32603,
+            // Custom error codes
+            RpcError::UnavailableIndex => -32000,
+            RpcError::DaemonError(ref e) => e.code,
+            RpcError::BadRequest(_) => -32001,
+        }
+    }
+
+    fn message(&self) -> String {
+        match *self {
+            RpcError::ParseError => "Parse error".to_string(),
+            RpcError::InvalidRequest => "Invalid request".to_string(),
+            RpcError::MethodNotFound => "Method not found".to_string(),
+            RpcError::InvalidParams => "Invalid params".to_string(),
+            RpcError::InternalError => "Internal error".to_string(),
+            RpcError::UnavailableIndex => "Index is still warming up".to_string(),
+            RpcError::DaemonError(ref e) => e.message.clone(),
+            RpcError::BadRequest(ref e) => format!("Bad request: {}", e),
+        }
+    }
+
+    fn from_error(e: anyhow::Error) -> Self {
+        if let Some(daemon_error) = e.downcast_ref::<bitcoincore_rpc::Error>() {
+            if let Some(rpc_error) = extract_bitcoind_error(daemon_error) {
+                RpcError::DaemonError(rpc_error.clone())
+            } else {
+                RpcError::BadRequest(e)
             }
+        } else {
+            RpcError::BadRequest(e)
         }
     }
 }
@@ -140,15 +169,47 @@ impl Rpc {
             metrics::default_duration_buckets(),
         );
 
-        let tracker = Tracker::new(config, metrics)?;
         let signal = Signal::new();
-        let daemon = Daemon::connect(config, signal.exit_flag(), tracker.metrics())?;
-        let cache = Cache::new(tracker.metrics());
+        let metrics_arc = Arc::new(metrics);
+        
+        // 创建 AtomicalsState
+        let storage = Arc::new(AtomicalsStorage::new(&config.db_dir)?);
+        let tx_parser = TxParser::new();
+        let runtime = tokio::runtime::Runtime::new()?;
+        let atomicals_state = Arc::new(runtime.block_on(async {
+            AtomicalsState::new(config.network, Arc::clone(&storage), tx_parser).await
+        })?);
+        
+        // 创建 Daemon
+        let daemon = Arc::new(Daemon::connect(config, signal.exit_flag(), &metrics_arc)?);
+        
+        // 创建 Chain
+        let chain = Arc::new(Chain::new(config.network, Arc::clone(&atomicals_state)));
+        
+        // 创建 Tracker
+        let tracker = Tracker::new(
+            Arc::clone(&daemon),
+            Arc::clone(&chain),
+            Arc::clone(&metrics_arc),
+            Arc::clone(&atomicals_state),
+        );
+        
+        let cache = Cache::new(&metrics_arc);
+        
+        // 从 Arc 中提取 Daemon
+        let daemon_value = match Arc::try_unwrap(daemon) {
+            Ok(d) => d,
+            Err(arc) => {
+                // 如果无法提取，则创建一个新的 Daemon 实例
+                Daemon::connect(config, signal.exit_flag(), &metrics_arc)?
+            }
+        };
+        
         Ok(Self {
             tracker,
             cache,
             rpc_duration,
-            daemon,
+            daemon: daemon_value,
             signal,
             banner: config.server_banner.clone(),
             port: config.electrum_rpc_addr.port(),
@@ -163,8 +224,9 @@ impl Rpc {
         self.daemon.new_block_notification()
     }
 
-    pub fn sync(&mut self) -> Result<bool> {
-        self.tracker.sync(&self.daemon, self.signal.exit_flag())
+    pub async fn sync(&mut self) -> Result<bool> {
+        self.tracker.sync(self.signal.exit_flag()).await?;
+        Ok(true)
     }
 
     pub fn update_client(&self, client: &mut Client) -> Result<Vec<String>> {
@@ -477,7 +539,7 @@ impl Rpc {
             .collect()
     }
 
-    fn handle_calls(&self, client: &mut Client, calls: Result<Calls, Value>) -> Value {
+    pub fn handle_calls(&self, client: &mut Client, calls: Result<Calls, Value>) -> Value {
         let calls: Calls = match calls {
             Ok(calls) => calls,
             Err(response) => return response, // JSON parsing failed - the response does not contain request id
@@ -495,6 +557,105 @@ impl Rpc {
             }
             Calls::Single(result) => self.single_call(client, result),
         }
+    }
+
+    pub fn handle_scripthash_subscriptions(&self, client: &mut Client) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        for (script_hash, status_hash) in client.status_hashes() {
+            let status = self.tracker.status(&script_hash);
+            if status.hash().map(|h| h != *status_hash).unwrap_or(true) {
+                result.push(script_hash.to_string());
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn handle_call(&self, client: &mut Client, call: Request) -> Value {
+        let method = call.method.clone();
+        let result = self.rpc_duration.observe_duration(&method, || {
+            self.handle_call_internal(client, call)
+        });
+        match result {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("rpc #{} {} failed: {}", client.id(), method, e);
+                Response::error(e)
+            }
+        }
+    }
+
+    fn handle_call_internal(&self, client: &mut Client, call: Request) -> Result<Value> {
+        let method = call.method.clone();
+        
+        // 根据方法名解析参数
+        let result = match method.as_str() {
+            "blockchain.block.header" => {
+                let height: usize = parse_params(&call.params)?;
+                self.block_header((height,))
+            },
+            "blockchain.block.headers" => {
+                let args: (usize, usize) = parse_params(&call.params)?;
+                self.block_headers(args)
+            },
+            "blockchain.estimatefee" => {
+                let blocks: u16 = parse_params(&call.params)?;
+                self.estimate_fee((blocks,))
+            },
+            "blockchain.headers.subscribe" => self.headers_subscribe(client),
+            "blockchain.relayfee" => self.relayfee(),
+            "blockchain.scripthash.get_balance" => {
+                let script_hash: ScriptHash = parse_params(&call.params)?;
+                self.scripthash_get_balance(client, &(script_hash,))
+            },
+            "blockchain.scripthash.get_history" => {
+                let script_hash: ScriptHash = parse_params(&call.params)?;
+                self.scripthash_get_history(client, &(script_hash,))
+            },
+            "blockchain.scripthash.listunspent" => {
+                let script_hash: ScriptHash = parse_params(&call.params)?;
+                self.scripthash_list_unspent(client, &(script_hash,))
+            },
+            "blockchain.scripthash.subscribe" => {
+                let script_hash: ScriptHash = parse_params(&call.params)?;
+                self.scripthash_subscribe(client, &(script_hash,))
+            },
+            "blockchain.scripthash.unsubscribe" => {
+                let script_hash: ScriptHash = parse_params(&call.params)?;
+                self.scripthash_unsubscribe(client, &(script_hash,))
+            },
+            "blockchain.transaction.broadcast" => {
+                let tx_hex: String = parse_params(&call.params)?;
+                self.transaction_broadcast(&(tx_hex,))
+            },
+            "blockchain.transaction.get" => {
+                let args: TxGetArgs = parse_params(&call.params)?;
+                self.transaction_get(&args)
+            },
+            "blockchain.transaction.get_merkle" => {
+                let args: (Txid, usize) = parse_params(&call.params)?;
+                self.transaction_get_merkle(&args)
+            },
+            "blockchain.transaction.id_from_pos" => {
+                let args: (usize, usize, bool) = parse_params(&call.params)?;
+                self.transaction_from_pos(args)
+            },
+            "mempool.get_fee_histogram" => self.get_fee_histogram(),
+            "server.banner" => Ok(json!(self.banner)),
+            "server.donation_address" => Ok(Value::Null),
+            "server.features" => self.features(),
+            "server.peers.subscribe" => Ok(json!([])),
+            "server.ping" => Ok(Value::Null),
+            "server.version" => {
+                let client_id: String = parse_params(&call.params)?;
+                let client_version = VersionRequest::Single("1.4".to_string());
+                self.version(&(client_id, client_version))
+            },
+            _ => {
+                bail!("unknown method: {}", method);
+            }
+        };
+        
+        Ok(result?)
     }
 
     fn try_multi_call(
@@ -537,10 +698,11 @@ impl Rpc {
             if self.tracker.status().is_err() {
                 // Allow only a few RPC (for sync status notification) not requiring index DB being compacted.
                 match &call.params {
-                    Params::BlockHeader(_)
-                    | Params::BlockHeaders(_)
-                    | Params::HeadersSubscribe
-                    | Params::Version(_) => (),
+                    Params::Banner => (),
+                    Params::BlockHeader(_) => (),
+                    Params::BlockHeaders(_) => (),
+                    Params::HeadersSubscribe => (),
+                    Params::Version(_) => (),
                     _ => return error_msg(&call.id, RpcError::UnavailableIndex),
                 };
             }
@@ -570,126 +732,291 @@ impl Rpc {
             call.response(result)
         })
     }
+
+    fn handle_multi_call(&self, client: &mut Client, calls: Calls) -> Value {
+        match calls {
+            Calls::Single(call_result) => match call_result {
+                Ok(call) => {
+                    if let Err(e) = check_request(&call) {
+                        return call.response(Err(e));
+                    }
+                    
+                    if self.tracker.status().is_err() {
+                        // Allow only a few RPC (for sync status notification) not requiring index DB being compacted.
+                        if !call.method.starts_with("blockchain.headers.subscribe") 
+                           && !call.method.starts_with("server.version") 
+                           && !call.method.starts_with("blockchain.block.header") 
+                           && !call.method.starts_with("blockchain.block.headers") {
+                            return error_msg(&call.id, RpcError::UnavailableIndex);
+                        }
+                    }
+                    
+                    let result = match call.method.as_str() {
+                        // 根据方法名解析参数
+                        "blockchain.block.header" => {
+                            let height: usize = parse_params(&call.params)?;
+                            self.block_header((height,))
+                        },
+                        "blockchain.block.headers" => {
+                            let args: (usize, usize) = parse_params(&call.params)?;
+                            self.block_headers(args)
+                        },
+                        "blockchain.estimatefee" => {
+                            let blocks: u16 = parse_params(&call.params)?;
+                            self.estimate_fee((blocks,))
+                        },
+                        "blockchain.headers.subscribe" => self.headers_subscribe(client),
+                        "blockchain.relayfee" => self.relayfee(),
+                        "blockchain.scripthash.get_balance" => {
+                            let script_hash: ScriptHash = parse_params(&call.params)?;
+                            self.scripthash_get_balance(client, &(script_hash,))
+                        },
+                        "blockchain.scripthash.get_history" => {
+                            let script_hash: ScriptHash = parse_params(&call.params)?;
+                            self.scripthash_get_history(client, &(script_hash,))
+                        },
+                        "blockchain.scripthash.listunspent" => {
+                            let script_hash: ScriptHash = parse_params(&call.params)?;
+                            self.scripthash_list_unspent(client, &(script_hash,))
+                        },
+                        "blockchain.scripthash.subscribe" => {
+                            let script_hash: ScriptHash = parse_params(&call.params)?;
+                            self.scripthash_subscribe(client, &(script_hash,))
+                        },
+                        "blockchain.scripthash.unsubscribe" => {
+                            let script_hash: ScriptHash = parse_params(&call.params)?;
+                            self.scripthash_unsubscribe(client, &(script_hash,))
+                        },
+                        "blockchain.transaction.broadcast" => {
+                            let tx_hex: String = parse_params(&call.params)?;
+                            self.transaction_broadcast(&(tx_hex,))
+                        },
+                        "blockchain.transaction.get" => {
+                            let args: TxGetArgs = parse_params(&call.params)?;
+                            self.transaction_get(&args)
+                        },
+                        "blockchain.transaction.get_merkle" => {
+                            let args: (Txid, usize) = parse_params(&call.params)?;
+                            self.transaction_get_merkle(&args)
+                        },
+                        "blockchain.transaction.id_from_pos" => {
+                            let args: (usize, usize, bool) = parse_params(&call.params)?;
+                            self.transaction_from_pos(args)
+                        },
+                        "mempool.get_fee_histogram" => self.get_fee_histogram(),
+                        "server.banner" => Ok(json!(self.banner)),
+                        "server.donation_address" => Ok(Value::Null),
+                        "server.features" => self.features(),
+                        "server.peers.subscribe" => Ok(json!([])),
+                        "server.ping" => Ok(Value::Null),
+                        "server.version" => {
+                            let client_id: String = parse_params(&call.params)?;
+                            let client_version = VersionRequest::Single("1.4".to_string());
+                            self.version(&(client_id, client_version))
+                        },
+                        _ => {
+                            bail!("unknown method: {}", call.method);
+                        }
+                    };
+                    
+                    call.response(result)
+                }
+                Err(response) => response,
+            },
+            Calls::Batch(batch) => {
+                let mut responses = Vec::with_capacity(batch.len());
+                for call_result in batch {
+                    match call_result {
+                        Ok(call) => {
+                            if let Err(e) = check_request(&call) {
+                                responses.push(call.response(Err(e)));
+                                continue;
+                            }
+                            
+                            if self.tracker.status().is_err() {
+                                // Allow only a few RPC (for sync status notification) not requiring index DB being compacted.
+                                if !call.method.starts_with("blockchain.headers.subscribe") 
+                                   && !call.method.starts_with("server.version") 
+                                   && !call.method.starts_with("blockchain.block.header") 
+                                   && !call.method.starts_with("blockchain.block.headers") {
+                                    responses.push(error_msg(&call.id, RpcError::UnavailableIndex));
+                                    continue;
+                                }
+                            }
+                            
+                            let result = match call.method.as_str() {
+                                // 根据方法名解析参数
+                                "blockchain.block.header" => {
+                                    let height: usize = parse_params(&call.params)?;
+                                    self.block_header((height,))
+                                },
+                                "blockchain.block.headers" => {
+                                    let args: (usize, usize) = parse_params(&call.params)?;
+                                    self.block_headers(args)
+                                },
+                                "blockchain.estimatefee" => {
+                                    let blocks: u16 = parse_params(&call.params)?;
+                                    self.estimate_fee((blocks,))
+                                },
+                                "blockchain.headers.subscribe" => self.headers_subscribe(client),
+                                "blockchain.relayfee" => self.relayfee(),
+                                "blockchain.scripthash.get_balance" => {
+                                    let script_hash: ScriptHash = parse_params(&call.params)?;
+                                    self.scripthash_get_balance(client, &(script_hash,))
+                                },
+                                "blockchain.scripthash.get_history" => {
+                                    let script_hash: ScriptHash = parse_params(&call.params)?;
+                                    self.scripthash_get_history(client, &(script_hash,))
+                                },
+                                "blockchain.scripthash.listunspent" => {
+                                    let script_hash: ScriptHash = parse_params(&call.params)?;
+                                    self.scripthash_list_unspent(client, &(script_hash,))
+                                },
+                                "blockchain.scripthash.subscribe" => {
+                                    let script_hash: ScriptHash = parse_params(&call.params)?;
+                                    self.scripthash_subscribe(client, &(script_hash,))
+                                },
+                                "blockchain.scripthash.unsubscribe" => {
+                                    let script_hash: ScriptHash = parse_params(&call.params)?;
+                                    self.scripthash_unsubscribe(client, &(script_hash,))
+                                },
+                                "blockchain.transaction.broadcast" => {
+                                    let tx_hex: String = parse_params(&call.params)?;
+                                    self.transaction_broadcast(&(tx_hex,))
+                                },
+                                "blockchain.transaction.get" => {
+                                    let args: TxGetArgs = parse_params(&call.params)?;
+                                    self.transaction_get(&args)
+                                },
+                                "blockchain.transaction.get_merkle" => {
+                                    let args: (Txid, usize) = parse_params(&call.params)?;
+                                    self.transaction_get_merkle(&args)
+                                },
+                                "blockchain.transaction.id_from_pos" => {
+                                    let args: (usize, usize, bool) = parse_params(&call.params)?;
+                                    self.transaction_from_pos(args)
+                                },
+                                "mempool.get_fee_histogram" => self.get_fee_histogram(),
+                                "server.banner" => Ok(json!(self.banner)),
+                                "server.donation_address" => Ok(Value::Null),
+                                "server.features" => self.features(),
+                                "server.peers.subscribe" => Ok(json!([])),
+                                "server.ping" => Ok(Value::Null),
+                                "server.version" => {
+                                    let client_id: String = parse_params(&call.params)?;
+                                    let client_version = VersionRequest::Single("1.4".to_string());
+                                    self.version(&(client_id, client_version))
+                                },
+                                _ => {
+                                    bail!("unknown method: {}", call.method);
+                                }
+                            };
+                            
+                            responses.push(call.response(result));
+                        }
+                        Err(response) => responses.push(response),
+                    }
+                }
+                json!(responses)
+            }
+        }
+    }
 }
 
-#[derive(Deserialize)]
 enum Params {
     Banner,
-    BlockHeader((usize,)),
-    BlockHeaders((usize, usize)),
-    TransactionBroadcast((String,)),
+    BlockHeader(u32),
+    BlockHeaders(BlockHeadersArgs),
     Donation,
-    EstimateFee((u16,)),
+    EstimateFee(u16),
     Features,
     HeadersSubscribe,
     MempoolFeeHistogram,
     PeersSubscribe,
     Ping,
     RelayFee,
-    ScriptHashGetBalance((ScriptHash,)),
-    ScriptHashGetHistory((ScriptHash,)),
-    ScriptHashListUnspent((ScriptHash,)),
-    ScriptHashSubscribe((ScriptHash,)),
-    ScriptHashUnsubscribe((ScriptHash,)),
-    TransactionGet(TxGetArgs),
-    TransactionGetMerkle((Txid, usize)),
-    TransactionFromPosition((usize, usize, bool)),
-    Version((String, VersionRequest)),
+    ScriptHashGetBalance(&'static ScriptHash),
+    ScriptHashGetHistory(&'static ScriptHash),
+    ScriptHashListUnspent(&'static ScriptHash),
+    ScriptHashSubscribe(&'static ScriptHash),
+    ScriptHashUnsubscribe(&'static ScriptHash),
+    TransactionBroadcast(&'static str),
+    TransactionGet(&'static TxGetArgs),
+    TransactionGetMerkle(&'static (Txid, u32)),
+    TransactionFromPosition(TransactionPositionArgs),
+    Version(&'static VersionRequest),
 }
 
-impl Params {
-    fn parse(method: &str, params: Value) -> std::result::Result<Params, StandardError> {
-        Ok(match method {
-            "blockchain.block.header" => Params::BlockHeader(convert(params)?),
-            "blockchain.block.headers" => Params::BlockHeaders(convert(params)?),
-            "blockchain.estimatefee" => Params::EstimateFee(convert(params)?),
-            "blockchain.headers.subscribe" => Params::HeadersSubscribe,
-            "blockchain.relayfee" => Params::RelayFee,
-            "blockchain.scripthash.get_balance" => Params::ScriptHashGetBalance(convert(params)?),
-            "blockchain.scripthash.get_history" => Params::ScriptHashGetHistory(convert(params)?),
-            "blockchain.scripthash.listunspent" => Params::ScriptHashListUnspent(convert(params)?),
-            "blockchain.scripthash.subscribe" => Params::ScriptHashSubscribe(convert(params)?),
-            "blockchain.scripthash.unsubscribe" => Params::ScriptHashUnsubscribe(convert(params)?),
-            "blockchain.transaction.broadcast" => Params::TransactionBroadcast(convert(params)?),
-            "blockchain.transaction.get" => Params::TransactionGet(convert(params)?),
-            "blockchain.transaction.get_merkle" => Params::TransactionGetMerkle(convert(params)?),
-            "blockchain.transaction.id_from_pos" => {
-                Params::TransactionFromPosition(convert(params)?)
-            }
-            "mempool.get_fee_histogram" => Params::MempoolFeeHistogram,
-            "server.banner" => Params::Banner,
-            "server.donation_address" => Params::Donation,
-            "server.features" => Params::Features,
-            "server.peers.subscribe" => Params::PeersSubscribe,
-            "server.ping" => Params::Ping,
-            "server.version" => Params::Version(convert(params)?),
-            _ => {
-                warn!("unknown method {}", method);
-                return Err(StandardError::MethodNotFound);
-            }
-        })
-    }
+#[derive(Debug, Clone, Copy)]
+struct BlockHeadersArgs {
+    start_height: u32,
+    count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransactionPositionArgs {
+    height: u32,
+    position: u32,
+    merkle: bool,
 }
 
 struct Call {
     id: Value,
     method: String,
-    params: Params,
+    params: Value,
 }
 
 impl Call {
-    fn parse(request: Request) -> Result<Call, Value> {
-        match Params::parse(&request.method, request.params) {
-            Ok(params) => Ok(Call {
-                id: request.id,
-                method: request.method,
-                params,
-            }),
-            Err(e) => Err(error_msg(&request.id, RpcError::Standard(e))),
-        }
+    fn from_request(request: Request) -> std::result::Result<Call, Value> {
+        let id = request.id;
+        let method = request.method;
+        let params = request.params;
+        Ok(Call { id, method, params })
     }
 
     fn response(&self, result: Result<Value>) -> Value {
         match result {
-            Ok(value) => result_msg(&self.id, value),
+            Ok(result) => Response::new(self.id.clone(), result),
             Err(err) => {
                 warn!("RPC {} failed: {:#}", self.method, err);
-                match err
-                    .downcast_ref::<bitcoincore_rpc::Error>()
-                    .and_then(extract_bitcoind_error)
-                {
-                    Some(e) => error_msg(&self.id, RpcError::DaemonError(e.clone())),
-                    None => error_msg(&self.id, RpcError::BadRequest(err)),
-                }
+                error_msg(&self.id, RpcError::from_error(err))
             }
         }
     }
 }
 
 enum Calls {
-    Batch(Vec<Result<Call, Value>>),
-    Single(Result<Call, Value>),
+    Single(std::result::Result<Call, Value>),
+    Batch(Vec<std::result::Result<Call, Value>>),
 }
 
 impl Calls {
     fn parse(requests: Requests) -> Calls {
         match requests {
-            Requests::Single(request) => Calls::Single(Call::parse(request)),
+            Requests::Single(request) => Calls::Single(Call::from_request(request)),
             Requests::Batch(batch) => {
-                Calls::Batch(batch.into_iter().map(Call::parse).collect::<Vec<_>>())
+                Calls::Batch(batch.into_iter().map(Call::from_request).collect())
             }
         }
     }
 }
 
-fn convert<T>(params: Value) -> std::result::Result<T, StandardError>
+fn parse_params<T>(params: &Value) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(params.clone())
+        .with_context(|| format!("invalid params: {}", params))
+}
+
+fn convert<T>(params: Value) -> std::result::Result<T, RpcError>
 where
     T: serde::de::DeserializeOwned,
 {
     let params_str = params.to_string();
     serde_json::from_value(params).map_err(|err| {
         warn!("invalid params {}: {}", params_str, err);
-        StandardError::InvalidParams
+        RpcError::InvalidParams
     })
 }
 
@@ -702,45 +1029,93 @@ fn result_msg(id: &Value, result: Value) -> Value {
 }
 
 fn error_msg(id: &Value, error: RpcError) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": error.to_value()})
+    error_code_msg(id, error.code(), error.message())
 }
 
-fn error_msg_no_id(err: StandardError) -> Value {
-    error_msg(&Value::Null, RpcError::Standard(err))
-}
-
-fn parse_requests(line: &str) -> Result<Requests, StandardError> {
-    match serde_json::from_str(line) {
-        // parse JSON from str
-        Ok(value) => match serde_json::from_value(value) {
-            // parse RPC from JSON
-            Ok(requests) => Ok(requests),
-            Err(err) => {
-                warn!("invalid RPC request ({:?}): {}", line, err);
-                Err(StandardError::InvalidRequest)
-            }
+fn error_msg_no_id(err: RpcError) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": err.code(),
+            "message": err.message(),
         },
-        Err(err) => {
-            warn!("invalid JSON ({:?}): {}", line, err);
-            Err(StandardError::ParseError)
-        }
+        "id": Value::Null,
+    })
+}
+
+fn parse_requests(line: &str) -> Result<Requests, RpcError> {
+    serde_json::from_str(line).map_err(|_| RpcError::ParseError)
+}
+
+fn check_request(call: &Call) -> Result<()> {
+    if call.method.starts_with("blockchain.") && !call.method.starts_with("blockchain.atomicals.") {
+        // Allow standard blockchain.* methods
+        return Ok(());
+    }
+    
+    if call.method.starts_with("server.") {
+        // Allow standard server.* methods
+        return Ok(());
+    }
+    
+    if call.method.starts_with("mempool.") {
+        // Allow standard mempool.* methods
+        return Ok(());
+    }
+    
+    bail!("method not found: {}", call.method);
+}
+
+#[derive(Debug)]
+struct Response {
+    id: Value,
+    result: Value,
+}
+
+impl Response {
+    fn new(id: Value, result: Value) -> Value {
+        json!({
+            "id": id,
+            "result": result,
+        })
+    }
+
+    fn error<E: std::error::Error>(e: E) -> Value {
+        json!({
+            "error": {
+                "code": -1,
+                "message": e.to_string(),
+            },
+            "id": Value::Null,
+        })
     }
 }
 
 fn parse_version(version: &str) -> Result<Version> {
     let result = version
         .split('.')
-        .map(|part| usize::from_str(part).with_context(|| format!("invalid version {}", version)))
+        .map(|part| part.parse::<usize>().with_context(|| format!("invalid version {}", version)))
         .collect::<Result<Vec<usize>>>()?;
-    Ok(Version(result))
+    if result.len() < 2 {
+        bail!("invalid version: {}", version);
+    }
+    Ok(Version {
+        major: result[0],
+        minor: result[1],
+        patch: result.get(2).cloned().unwrap_or(0),
+    })
 }
 
 #[derive(PartialOrd, PartialEq, Debug)]
-struct Version(Vec<usize>);
+struct Version {
+    major: usize,
+    minor: usize,
+    patch: usize,
+}
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for (i, v) in self.0.iter().enumerate() {
+        for (i, v) in [&self.major, &self.minor, &self.patch].iter().enumerate() {
             if i > 0 {
                 write!(f, ".")?;
             }
@@ -763,15 +1138,26 @@ fn check_between(version_str: &str, min_str: &str, max_str: &str) -> Result<()> 
     Ok(())
 }
 
+fn error_code_msg(id: &Value, code: i32, message: String) -> Value {
+    json!({
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "jsonrpc": "2.0",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_between, parse_version, Version};
 
     #[test]
     fn test_version() {
-        assert_eq!(parse_version("1").unwrap(), Version(vec![1]));
-        assert_eq!(parse_version("1.2").unwrap(), Version(vec![1, 2]));
-        assert_eq!(parse_version("1.2.345").unwrap(), Version(vec![1, 2, 345]));
+        assert_eq!(parse_version("1").unwrap(), Version { major: 1, minor: 0, patch: 0 });
+        assert_eq!(parse_version("1.2").unwrap(), Version { major: 1, minor: 2, patch: 0 });
+        assert_eq!(parse_version("1.2.345").unwrap(), Version { major: 1, minor: 2, patch: 345 });
 
         assert!(parse_version("1.2").unwrap() < parse_version("1.100").unwrap());
     }
@@ -788,4 +1174,19 @@ mod tests {
         assert!(check_between("1.4", "1.4.1", "1.5").is_err());
         assert!(check_between("1.4", "1", "1").is_err());
     }
+}
+
+async fn handle_request(
+    server: &Rpc,
+    client: &mut Client,
+    line: String,
+) -> Result<Option<Value>> {
+    let requests = match parse_requests(&line) {
+        Ok(requests) => requests,
+        Err(e) => return Ok(Some(error_msg_no_id(e))),
+    };
+    
+    let calls = Calls::parse(requests);
+    let response = server.handle_multi_call(client, calls);
+    Ok(Some(response))
 }

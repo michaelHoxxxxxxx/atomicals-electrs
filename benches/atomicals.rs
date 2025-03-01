@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use electrs::atomicals::{
-    AtomicalsState, AtomicalsIndexer, AtomicalsOperation,
+    AtomicalsState, AtomicalsIndexer, AtomicalOperation,
     websocket::{WsServer, WsMessage},
 };
 use electrs::config::Config;
@@ -57,9 +57,19 @@ fn create_test_transaction() -> Transaction {
 }
 
 /// 创建测试 Atomicals 操作
-fn create_test_atomicals_operation() -> AtomicalsOperation {
-    // 从 tests/common/test_data.rs 复用测试数据生成器
-    electrs::tests::common::TestDataGenerator::generate_atomicals_operation()
+fn create_test_atomicals_operation() -> AtomicalOperation {
+    // 创建一个简单的 Mint 操作
+    let txid = bitcoin::Txid::from_hex("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+    let atomical_id = electrs::atomicals::AtomicalId { txid, vout: 0 };
+    
+    AtomicalOperation::Mint {
+        id: atomical_id,
+        atomical_type: electrs::atomicals::AtomicalType::NFT,
+        metadata: Some(serde_json::json!({
+            "name": "Test NFT",
+            "description": "Test Description"
+        })),
+    }
 }
 
 // 1. 区块处理性能测试

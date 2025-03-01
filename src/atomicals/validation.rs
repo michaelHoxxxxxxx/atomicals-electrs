@@ -29,18 +29,18 @@ pub fn validate_operation(
     state: &AtomicalsState,
 ) -> Result<()> {
     match operation {
-        AtomicalOperation::Mint { atomical_type, metadata } => {
+        AtomicalOperation::Mint { id: _, atomical_type, metadata } => {
             validate_mint(atomical_type, metadata)
         }
-        AtomicalOperation::Update { atomical_id, metadata: _  } => {
-            validate_update(state, tx, atomical_id)
+        AtomicalOperation::Update { id, metadata: _  } => {
+            validate_update(state, tx, id)
         }
-        AtomicalOperation::Seal { atomical_id } => {
-            validate_seal(state, tx, atomical_id)
+        AtomicalOperation::Seal { id } => {
+            validate_seal(state, tx, id)
         }
-        AtomicalOperation::Transfer { atomical_id, output_index } => {
+        AtomicalOperation::Transfer { id, output_index } => {
             // 检查 Atomical 是否存在
-            if !state.exists(atomical_id)? {
+            if !state.exists(id)? {
                 return Err(anyhow!("Atomical does not exist"));
             }
 
@@ -50,7 +50,7 @@ pub fn validate_operation(
             }
 
             // 检查是否已被封印
-            if state.is_sealed(atomical_id)? {
+            if state.is_sealed(id)? {
                 return Err(anyhow!("Cannot transfer sealed Atomical"));
             }
 
@@ -104,20 +104,24 @@ fn validate_mint(atomical_type: &AtomicalType, metadata: &Option<Value>) -> Resu
                 return Err(anyhow!("Realm metadata must contain a realm_name field"));
             }
         }
+        AtomicalType::Unknown => {
+            // 对于未知类型，我们不进行特定验证
+            return Err(anyhow!("Unknown atomical type"));
+        }
     }
     
     Ok(())
 }
 
 /// 验证更新操作
-fn validate_update(state: &AtomicalsState, _tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
+fn validate_update(state: &AtomicalsState, _tx: &Transaction, id: &AtomicalId) -> Result<()> {
     // 检查 Atomical 是否存在
-    if !state.exists(atomical_id)? {
+    if !state.exists(id)? {
         return Err(anyhow!("Atomical does not exist"));
     }
     
     // 检查 Atomical 是否已被封印
-    if state.is_sealed(atomical_id)? {
+    if state.is_sealed(id)? {
         return Err(anyhow!("Cannot update sealed Atomical"));
     }
     
@@ -125,14 +129,14 @@ fn validate_update(state: &AtomicalsState, _tx: &Transaction, atomical_id: &Atom
 }
 
 /// 验证封印操作
-fn validate_seal(state: &AtomicalsState, _tx: &Transaction, atomical_id: &AtomicalId) -> Result<()> {
+fn validate_seal(state: &AtomicalsState, _tx: &Transaction, id: &AtomicalId) -> Result<()> {
     // 检查 Atomical 是否存在
-    if !state.exists(atomical_id)? {
+    if !state.exists(id)? {
         return Err(anyhow!("Atomical does not exist"));
     }
     
     // 检查 Atomical 是否已被封印
-    if state.is_sealed(atomical_id)? {
+    if state.is_sealed(id)? {
         return Err(anyhow!("Atomical is already sealed"));
     }
     
@@ -246,6 +250,9 @@ mod tests {
 
         // 测试缺失元数据
         assert!(validate_mint(&AtomicalType::NFT, &None).is_err());
+
+        // 测试未知类型
+        assert!(validate_mint(&AtomicalType::Unknown, &Some(nft_metadata)).is_err());
     }
 
     #[test]
@@ -292,7 +299,7 @@ mod tests {
 
         // 测试转移不存在的 Atomical
         assert!(validate_operation(
-            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &AtomicalOperation::Transfer { id: atomical_id, output_index: 0 },
             &tx,
             &state
         ).is_err());
@@ -300,14 +307,14 @@ mod tests {
         // 模拟 Atomical 存在
         state.create(&atomical_id, AtomicalType::NFT).unwrap();
         assert!(validate_operation(
-            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &AtomicalOperation::Transfer { id: atomical_id, output_index: 0 },
             &tx,
             &state
         ).is_ok());
 
         // 测试无效的输出索引
         assert!(validate_operation(
-            &AtomicalOperation::Transfer { atomical_id, output_index: 1 },
+            &AtomicalOperation::Transfer { id: atomical_id, output_index: 1 },
             &tx,
             &state
         ).is_err());
@@ -315,7 +322,7 @@ mod tests {
         // 测试转移已封印的 Atomical
         state.seal(&atomical_id).unwrap();
         assert!(validate_operation(
-            &AtomicalOperation::Transfer { atomical_id, output_index: 0 },
+            &AtomicalOperation::Transfer { id: atomical_id, output_index: 0 },
             &tx,
             &state
         ).is_err());
@@ -330,6 +337,7 @@ mod tests {
 
         // 测试铸造操作
         let mint_op = AtomicalOperation::Mint {
+            id: atomical_id,
             atomical_type: AtomicalType::NFT,
             metadata: serde_json::json!({
                 "name": "Test NFT",
@@ -340,6 +348,7 @@ mod tests {
 
         // 测试无效的铸造操作
         let invalid_mint_op = AtomicalOperation::Mint {
+            id: atomical_id,
             atomical_type: AtomicalType::NFT,
             metadata: serde_json::json!({
                 "description": "Missing name field",
@@ -350,7 +359,7 @@ mod tests {
         // 测试转移操作
         validator.state.create(&atomical_id, AtomicalType::NFT).unwrap();
         let transfer_op = AtomicalOperation::Transfer {
-            atomical_id,
+            id: atomical_id,
             output_index: 0,
         };
         assert!(validator.validate_operation(&tx, &transfer_op).is_ok());
