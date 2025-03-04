@@ -100,17 +100,413 @@ pub enum AtomicalOperation {
         /// ID of the Atomical being sealed
         id: AtomicalId,
     },
+    /// Deploy a distributed mint fungible token (DFT)
+    DeployDFT {
+        /// ID of the Atomical being deployed
+        id: AtomicalId,
+        /// Ticker of the DFT
+        ticker: String,
+        /// Maximum supply
+        max_supply: u64,
+        /// Optional metadata
+        metadata: Option<serde_json::Value>,
+    },
+    /// Mint tokens of a distributed mint type (DFT)
+    MintDFT {
+        /// ID of the parent DFT Atomical
+        parent_id: AtomicalId,
+        /// Amount to mint
+        amount: u64,
+    },
+    /// Event operation (message/response/reply)
+    Event {
+        /// ID of the Atomical for the event
+        id: AtomicalId,
+        /// Event data
+        data: serde_json::Value,
+    },
+    /// Store data on a transaction
+    Data {
+        /// ID of the Atomical
+        id: AtomicalId,
+        /// Data payload
+        data: serde_json::Value,
+    },
+    /// Extract - move atomical to 0'th output
+    Extract {
+        /// ID of the Atomical
+        id: AtomicalId,
+    },
+    /// Split operation
+    Split {
+        /// ID of the Atomical
+        id: AtomicalId,
+        /// Output indices and amounts
+        outputs: Vec<(u32, u64)>,
+    },
 }
 
 impl AtomicalOperation {
     /// Parse operation data from transaction
-    pub fn from_tx_data(_data: &[u8]) -> Option<Self> {
-        // TODO: Implement parsing logic for operation data
-        // This will involve:
-        // 1. Parsing the operation type
-        // 2. Parsing operation-specific data
-        // 3. Validating the data format
-        None
+    pub fn from_tx_data(data: &[u8]) -> Option<Self> {
+        if data.len() < 4 {
+            return None;
+        }
+
+        // 检查是否以 "atom" 开头
+        if &data[0..4] != b"atom" {
+            return None;
+        }
+
+        let mut offset = 4;
+        
+        // 解析操作类型
+        if offset >= data.len() {
+            return None;
+        }
+
+        // 获取操作类型长度
+        let op_len = data[offset] as usize;
+        offset += 1;
+        
+        if offset + op_len > data.len() {
+            return None;
+        }
+        
+        // 获取操作类型字符串
+        let op_type = match std::str::from_utf8(&data[offset..offset + op_len]) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        
+        offset += op_len;
+
+        // 根据操作类型解析不同的操作
+        match op_type {
+            "nft" => {
+                // 解析 NFT 铸造操作
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                // 解析元数据
+                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => Some(value),
+                    Err(_) => None,
+                };
+                
+                // 创建一个临时 ID (将在后续处理中被替换)
+                let id = AtomicalId {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                };
+                
+                Some(Self::Mint {
+                    id,
+                    atomical_type: AtomicalType::NFT,
+                    metadata,
+                })
+            },
+            "ft" => {
+                // 解析 FT 铸造操作
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                // 解析元数据
+                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => Some(value),
+                    Err(_) => None,
+                };
+                
+                // 创建一个临时 ID (将在后续处理中被替换)
+                let id = AtomicalId {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                };
+                
+                Some(Self::Mint {
+                    id,
+                    atomical_type: AtomicalType::FT,
+                    metadata,
+                })
+            },
+            "dft" => {
+                // 解析分布式铸造代币部署操作
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                // 解析 DFT 数据
+                let dft_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                // 提取必要字段
+                let ticker = match dft_data.get("ticker") {
+                    Some(t) => match t.as_str() {
+                        Some(s) => s.to_string(),
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                
+                let max_supply = match dft_data.get("max_supply") {
+                    Some(s) => match s.as_u64() {
+                        Some(n) => n,
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                
+                let metadata = dft_data.get("meta").cloned();
+                
+                // 创建一个临时 ID (将在后续处理中被替换)
+                let id = AtomicalId {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                };
+                
+                Some(Self::DeployDFT {
+                    id,
+                    ticker,
+                    max_supply,
+                    metadata,
+                })
+            },
+            "dmt" => {
+                // 解析分布式铸造代币铸造操作
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                // 解析 DMT 数据
+                let dmt_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                // 提取父 Atomical ID
+                let parent_id_str = match dmt_data.get("parent_id") {
+                    Some(p) => match p.as_str() {
+                        Some(s) => s,
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                
+                // 解析父 ID 字符串
+                let parts: Vec<&str> = parent_id_str.split(':').collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                
+                let txid = match Txid::from_str(parts[0]) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                let vout = match parts[1].parse::<u32>() {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                
+                let parent_id = AtomicalId { txid, vout };
+                
+                // 提取铸造数量
+                let amount = match dmt_data.get("amount") {
+                    Some(a) => match a.as_u64() {
+                        Some(n) => n,
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                
+                Some(Self::MintDFT {
+                    parent_id,
+                    amount,
+                })
+            },
+            "mod" => {
+                // 解析更新操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                offset += 4;
+                
+                let id = AtomicalId { txid, vout };
+                
+                // 解析元数据
+                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                Some(Self::Update {
+                    id,
+                    metadata,
+                })
+            },
+            "sl" => {
+                // 解析封印操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                let id = AtomicalId { txid, vout };
+                
+                Some(Self::Seal { id })
+            },
+            "evt" => {
+                // 解析事件操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                offset += 4;
+                
+                let id = AtomicalId { txid, vout };
+                
+                // 解析事件数据
+                let data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                Some(Self::Event { id, data })
+            },
+            "dat" => {
+                // 解析数据存储操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                offset += 4;
+                
+                let id = AtomicalId { txid, vout };
+                
+                // 解析数据
+                let data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                Some(Self::Data { id, data })
+            },
+            "x" => {
+                // 解析提取操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                let id = AtomicalId { txid, vout };
+                
+                Some(Self::Extract { id })
+            },
+            "y" => {
+                // 解析分割操作
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                // 解析 Atomical ID
+                let txid_bytes = &data[offset..offset + 32];
+                let txid = match Txid::from_slice(txid_bytes) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                
+                offset += 32;
+                
+                let vout_bytes = &data[offset..offset + 4];
+                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
+                
+                offset += 4;
+                
+                let id = AtomicalId { txid, vout };
+                
+                // 解析输出信息
+                let outputs_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
+                
+                let mut outputs = Vec::new();
+                
+                if let Some(outputs_array) = outputs_data.as_array() {
+                    for output in outputs_array {
+                        if let (Some(idx), Some(amount)) = (output.get(0).and_then(|v| v.as_u64()), output.get(1).and_then(|v| v.as_u64())) {
+                            outputs.push((idx as u32, amount));
+                        }
+                    }
+                }
+                
+                Some(Self::Split { id, outputs })
+            },
+            _ => None,
+        }
     }
 
     /// Get the type of operation
@@ -120,6 +516,12 @@ impl AtomicalOperation {
             Self::Transfer { .. } => "transfer",
             Self::Update { .. } => "update",
             Self::Seal { .. } => "seal",
+            Self::DeployDFT { .. } => "deploy_dft",
+            Self::MintDFT { .. } => "mint_dft",
+            Self::Event { .. } => "event",
+            Self::Data { .. } => "data",
+            Self::Extract { .. } => "extract",
+            Self::Split { .. } => "split",
         }
     }
 
@@ -141,6 +543,36 @@ impl AtomicalOperation {
     /// Check if the operation is a seal operation
     pub fn is_seal(&self) -> bool {
         matches!(self, Self::Seal { .. })
+    }
+    
+    /// Check if the operation is a deploy DFT operation
+    pub fn is_deploy_dft(&self) -> bool {
+        matches!(self, Self::DeployDFT { .. })
+    }
+    
+    /// Check if the operation is a mint DFT operation
+    pub fn is_mint_dft(&self) -> bool {
+        matches!(self, Self::MintDFT { .. })
+    }
+    
+    /// Check if the operation is an event operation
+    pub fn is_event(&self) -> bool {
+        matches!(self, Self::Event { .. })
+    }
+    
+    /// Check if the operation is a data operation
+    pub fn is_data(&self) -> bool {
+        matches!(self, Self::Data { .. })
+    }
+    
+    /// Check if the operation is an extract operation
+    pub fn is_extract(&self) -> bool {
+        matches!(self, Self::Extract { .. })
+    }
+    
+    /// Check if the operation is a split operation
+    pub fn is_split(&self) -> bool {
+        matches!(self, Self::Split { .. })
     }
 }
 
@@ -458,6 +890,29 @@ mod tests {
                 metadata: json!({}),
             },
             AtomicalOperation::Seal { id: atomical_id },
+            AtomicalOperation::DeployDFT {
+                id: atomical_id,
+                ticker: "TEST".to_string(),
+                max_supply: 100,
+                metadata: None,
+            },
+            AtomicalOperation::MintDFT {
+                parent_id: atomical_id,
+                amount: 10,
+            },
+            AtomicalOperation::Event {
+                id: atomical_id,
+                data: json!({}),
+            },
+            AtomicalOperation::Data {
+                id: atomical_id,
+                data: json!({}),
+            },
+            AtomicalOperation::Extract { id: atomical_id },
+            AtomicalOperation::Split {
+                id: atomical_id,
+                outputs: vec![(0, 10), (1, 20)],
+            },
         ];
 
         // 验证每个操作的类型检查方法是互斥的
@@ -468,24 +923,120 @@ mod tests {
                     assert!(!op.is_transfer());
                     assert!(!op.is_update());
                     assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
                 }
                 AtomicalOperation::Transfer { .. } => {
                     assert!(!op.is_mint());
                     assert!(op.is_transfer());
                     assert!(!op.is_update());
                     assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
                 }
                 AtomicalOperation::Update { .. } => {
                     assert!(!op.is_mint());
                     assert!(!op.is_transfer());
                     assert!(op.is_update());
                     assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
                 }
                 AtomicalOperation::Seal { .. } => {
                     assert!(!op.is_mint());
                     assert!(!op.is_transfer());
                     assert!(!op.is_update());
                     assert!(op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::DeployDFT { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::MintDFT { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::Event { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::Data { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::Extract { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(op.is_extract());
+                    assert!(!op.is_split());
+                }
+                AtomicalOperation::Split { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(op.is_split());
                 }
             }
         }

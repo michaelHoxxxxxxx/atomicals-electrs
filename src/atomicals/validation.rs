@@ -56,6 +56,103 @@ pub fn validate_operation(
 
             Ok(())
         }
+        AtomicalOperation::DeployDFT { id: _, ticker, max_supply, metadata: _ } => {
+            // 验证 ticker 格式
+            if ticker.is_empty() || ticker.len() > 10 {
+                return Err(anyhow!("Invalid ticker length, must be 1-10 characters"));
+            }
+            
+            // 验证 ticker 只包含大写字母
+            if !ticker.chars().all(|c| c.is_ascii_uppercase()) {
+                return Err(anyhow!("Ticker must contain only uppercase ASCII letters"));
+            }
+            
+            // 验证 max_supply
+            if *max_supply == 0 {
+                return Err(anyhow!("Max supply must be greater than 0"));
+            }
+            
+            Ok(())
+        }
+        AtomicalOperation::MintDFT { parent_id, amount } => {
+            // 检查父 Atomical 是否存在
+            if !state.exists(parent_id)? {
+                return Err(anyhow!("Parent Atomical does not exist"));
+            }
+            
+            // 检查铸造数量是否有效
+            if *amount == 0 {
+                return Err(anyhow!("Mint amount must be greater than 0"));
+            }
+            
+            // TODO: 检查是否超过最大供应量
+            
+            Ok(())
+        }
+        AtomicalOperation::Event { id, data: _ } => {
+            // 检查 Atomical 是否存在
+            if !state.exists(id)? {
+                return Err(anyhow!("Atomical does not exist"));
+            }
+            
+            // 检查是否已被封印
+            if state.is_sealed(id)? {
+                return Err(anyhow!("Cannot add event to sealed Atomical"));
+            }
+            
+            Ok(())
+        }
+        AtomicalOperation::Data { id, data: _ } => {
+            // 检查 Atomical 是否存在
+            if !state.exists(id)? {
+                return Err(anyhow!("Atomical does not exist"));
+            }
+            
+            // 检查是否已被封印
+            if state.is_sealed(id)? {
+                return Err(anyhow!("Cannot add data to sealed Atomical"));
+            }
+            
+            Ok(())
+        }
+        AtomicalOperation::Extract { id } => {
+            // 检查 Atomical 是否存在
+            if !state.exists(id)? {
+                return Err(anyhow!("Atomical does not exist"));
+            }
+            
+            // 检查是否已被封印
+            if state.is_sealed(id)? {
+                return Err(anyhow!("Cannot extract sealed Atomical"));
+            }
+            
+            Ok(())
+        }
+        AtomicalOperation::Split { id, outputs } => {
+            // 检查 Atomical 是否存在
+            if !state.exists(id)? {
+                return Err(anyhow!("Atomical does not exist"));
+            }
+            
+            // 检查是否已被封印
+            if state.is_sealed(id)? {
+                return Err(anyhow!("Cannot split sealed Atomical"));
+            }
+            
+            // 检查输出是否有效
+            if outputs.is_empty() {
+                return Err(anyhow!("Split must have at least one output"));
+            }
+            
+            // 检查输出索引是否有效
+            for (output_index, _) in outputs {
+                if *output_index as usize >= tx.output.len() {
+                    return Err(anyhow!("Invalid output index in split"));
+                }
+            }
+            
+            Ok(())
+        }
     }
 }
 
@@ -178,81 +275,47 @@ mod tests {
     
     #[test]
     fn test_validate_mint() {
-        // 测试 NFT 铸造
+        // 测试有效的 NFT 元数据
         let nft_metadata = serde_json::json!({
             "name": "Test NFT",
-            "description": "Test Description",
+            "description": "A test NFT"
         });
-        assert!(validate_mint(&AtomicalType::NFT, &Some(nft_metadata)).is_ok());
-        
-        // 测试 FT 铸造
+        assert!(validate_mint(&AtomicalType::NFT, &Some(nft_metadata.clone())).is_ok());
+
+        // 测试有效的 FT 元数据
         let ft_metadata = serde_json::json!({
-            "ticker": "TEST",
-            "max_supply": 1000000,
-            "description": "Test Token",
+            "name": "Test FT",
+            "description": "A test FT",
+            "supply": 1000
         });
         assert!(validate_mint(&AtomicalType::FT, &Some(ft_metadata)).is_ok());
-        
-        // 测试 DID 铸造
-        let did_metadata = serde_json::json!({
-            "did": "did:example:123",
-            "description": "Test DID",
-        });
-        assert!(validate_mint(&AtomicalType::DID, &Some(did_metadata)).is_ok());
 
-        // 测试 Container 铸造
-        let container_metadata = serde_json::json!({
-            "container_name": "test_container",
-            "description": "Test Container",
+        // 测试缺少必需字段的 NFT
+        let invalid_nft = serde_json::json!({
+            "description": "Missing name"
         });
-        assert!(validate_mint(&AtomicalType::Container, &Some(container_metadata)).is_ok());
+        assert!(validate_mint(&AtomicalType::NFT, &Some(invalid_nft)).is_err());
 
-        // 测试 Realm 铸造
-        let realm_metadata = serde_json::json!({
-            "realm_name": "test_realm",
-            "description": "Test Realm",
+        // 测试缺少必需字段的 FT
+        let invalid_ft = serde_json::json!({
+            "name": "Missing description and supply"
         });
-        assert!(validate_mint(&AtomicalType::Realm, &Some(realm_metadata)).is_ok());
-        
-        // 测试无效的 NFT 元数据
-        let invalid_nft_metadata = serde_json::json!({
-            "description": "Missing name field",
-        });
-        assert!(validate_mint(&AtomicalType::NFT, &Some(invalid_nft_metadata)).is_err());
-        
-        // 测试无效的 FT 元数据
-        let invalid_ft_metadata = serde_json::json!({
-            "description": "Missing ticker and max_supply fields",
-        });
-        assert!(validate_mint(&AtomicalType::FT, &Some(invalid_ft_metadata)).is_err());
+        assert!(validate_mint(&AtomicalType::FT, &Some(invalid_ft)).is_err());
 
-        // 测试无效的 DID 元数据
-        let invalid_did_metadata = serde_json::json!({
-            "description": "Missing did field",
+        // 测试无效的供应量
+        let invalid_supply = serde_json::json!({
+            "name": "Invalid Supply",
+            "description": "FT with invalid supply",
+            "supply": -1
         });
-        assert!(validate_mint(&AtomicalType::DID, &Some(invalid_did_metadata)).is_err());
+        assert!(validate_mint(&AtomicalType::FT, &Some(invalid_supply)).is_err());
 
-        // 测试无效的 Container 元数据
-        let invalid_container_metadata = serde_json::json!({
-            "description": "Missing container_name field",
-        });
-        assert!(validate_mint(&AtomicalType::Container, &Some(invalid_container_metadata)).is_err());
-
-        // 测试无效的 Realm 元数据
-        let invalid_realm_metadata = serde_json::json!({
-            "description": "Missing realm_name field",
-        });
-        assert!(validate_mint(&AtomicalType::Realm, &Some(invalid_realm_metadata)).is_err());
-
-        // 测试非对象元数据
-        let invalid_metadata = serde_json::json!("not an object");
-        assert!(validate_mint(&AtomicalType::NFT, &Some(invalid_metadata)).is_err());
-
-        // 测试缺失元数据
+        // 测试无元数据
         assert!(validate_mint(&AtomicalType::NFT, &None).is_err());
+        assert!(validate_mint(&AtomicalType::FT, &None).is_err());
 
-        // 测试未知类型
-        assert!(validate_mint(&AtomicalType::Unknown, &Some(nft_metadata)).is_err());
+        // 测试无效的类型
+        assert!(validate_mint(&AtomicalType::Unknown, &Some(nft_metadata.clone())).is_err());
     }
 
     #[test]

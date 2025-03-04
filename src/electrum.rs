@@ -71,14 +71,22 @@ enum Requests {
     Batch(Vec<Request>),
 }
 
-#[derive(Deserialize, Debug, PartialEq, Eq)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum VersionRequest {
     Single(String),
-    MinMax(String, String),
+    Tuple(String, String),
 }
 
-#[derive(Deserialize)]
+impl ToString for VersionRequest {
+    fn to_string(&self) -> String {
+        match self {
+            VersionRequest::Single(s) => s.clone(),
+            VersionRequest::Tuple(_, v) => v.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 enum TxGetArgs {
     Txid((Txid,)),
@@ -509,7 +517,7 @@ impl Rpc {
     fn version(&self, (client_id, client_version): &(String, VersionRequest)) -> Result<Value> {
         match client_version {
             VersionRequest::Single(exact) => check_between(PROTOCOL_VERSION, exact, exact),
-            VersionRequest::MinMax(min, max) => check_between(PROTOCOL_VERSION, min, max),
+            VersionRequest::Tuple(min, max) => check_between(PROTOCOL_VERSION, min, max),
         }
         .with_context(|| format!("unsupported request {:?} by {}", client_version, client_id))?;
         Ok(json!([self.server_id(), PROTOCOL_VERSION]))
@@ -588,56 +596,102 @@ impl Rpc {
         let method = call.method.clone();
         
         // 根据方法名解析参数
-        let result = match method.as_str() {
+        let result = match call.method.as_str() {
             "blockchain.block.header" => {
-                let height: usize = parse_params(&call.params)?;
-                self.block_header((height,))
+                match parse_params::<usize>(&call.params) {
+                    Ok(height) => self.block_header((height,)),
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.block.headers" => {
-                let args: (usize, usize) = parse_params(&call.params)?;
-                self.block_headers(args)
+                match parse_params::<(usize, usize)>(&call.params) {
+                    Ok(args) => self.block_headers(args),
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.estimatefee" => {
-                let blocks: u16 = parse_params(&call.params)?;
-                self.estimate_fee((blocks,))
+                match parse_params::<u16>(&call.params) {
+                    Ok(blocks) => self.estimate_fee((blocks,)),
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.headers.subscribe" => self.headers_subscribe(client),
             "blockchain.relayfee" => self.relayfee(),
             "blockchain.scripthash.get_balance" => {
-                let script_hash: ScriptHash = parse_params(&call.params)?;
-                self.scripthash_get_balance(client, &(script_hash,))
+                match parse_params::<ScriptHash>(&call.params) {
+                    Ok(script_hash) => {
+                        let sh = script_hash.clone();
+                        self.scripthash_get_balance(client, &(sh,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.scripthash.get_history" => {
-                let script_hash: ScriptHash = parse_params(&call.params)?;
-                self.scripthash_get_history(client, &(script_hash,))
+                match parse_params::<ScriptHash>(&call.params) {
+                    Ok(script_hash) => {
+                        let sh = script_hash.clone();
+                        self.scripthash_get_history(client, &(sh,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.scripthash.listunspent" => {
-                let script_hash: ScriptHash = parse_params(&call.params)?;
-                self.scripthash_list_unspent(client, &(script_hash,))
+                match parse_params::<ScriptHash>(&call.params) {
+                    Ok(script_hash) => {
+                        let sh = script_hash.clone();
+                        self.scripthash_list_unspent(client, &(sh,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.scripthash.subscribe" => {
-                let script_hash: ScriptHash = parse_params(&call.params)?;
-                self.scripthash_subscribe(client, &(script_hash,))
+                match parse_params::<ScriptHash>(&call.params) {
+                    Ok(script_hash) => {
+                        let sh = script_hash.clone();
+                        self.scripthash_subscribe(client, &(sh,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.scripthash.unsubscribe" => {
-                let script_hash: ScriptHash = parse_params(&call.params)?;
-                self.scripthash_unsubscribe(client, &(script_hash,))
+                match parse_params::<ScriptHash>(&call.params) {
+                    Ok(script_hash) => {
+                        let sh = script_hash.clone();
+                        self.scripthash_unsubscribe(client, &(sh,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.transaction.broadcast" => {
-                let tx_hex: String = parse_params(&call.params)?;
-                self.transaction_broadcast(&(tx_hex,))
+                match parse_params::<String>(&call.params) {
+                    Ok(tx_hex) => {
+                        let tx = tx_hex.to_string();
+                        self.transaction_broadcast(&(tx,))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.transaction.get" => {
-                let args: TxGetArgs = parse_params(&call.params)?;
-                self.transaction_get(&args)
+                match parse_params::<TxGetArgs>(&call.params) {
+                    Ok(args) => self.transaction_get(&args),
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.transaction.get_merkle" => {
-                let args: (Txid, usize) = parse_params(&call.params)?;
-                self.transaction_get_merkle(&args)
+                match parse_params::<(Txid, u32)>(&call.params) {
+                    Ok(args) => {
+                        let tx_id = args.0.clone();
+                        let h = args.1 as usize;
+                        self.transaction_get_merkle(&(tx_id, h))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             "blockchain.transaction.id_from_pos" => {
-                let args: (usize, usize, bool) = parse_params(&call.params)?;
-                self.transaction_from_pos(args)
+                match parse_params::<(u32, u32, bool)>(&call.params) {
+                    Ok(args) => self.transaction_from_pos((args.0 as usize, args.1 as usize, args.2)),
+                    Err(e) => Err(e),
+                }
             },
             "mempool.get_fee_histogram" => self.get_fee_histogram(),
             "server.banner" => Ok(json!(self.banner)),
@@ -646,12 +700,17 @@ impl Rpc {
             "server.peers.subscribe" => Ok(json!([])),
             "server.ping" => Ok(Value::Null),
             "server.version" => {
-                let client_id: String = parse_params(&call.params)?;
-                let client_version = VersionRequest::Single("1.4".to_string());
-                self.version(&(client_id, client_version))
+                match parse_params::<VersionRequest>(&call.params) {
+                    Ok(client_id) => {
+                        let id = client_id.to_string();
+                        let client_version = VersionRequest::Single("1.4".to_string());
+                        self.version(&(id, client_version))
+                    },
+                    Err(e) => Err(e),
+                }
             },
             _ => {
-                bail!("unknown method: {}", method);
+                Err(anyhow::anyhow!("unknown method: {}", method))
             }
         };
         
@@ -706,29 +765,124 @@ impl Rpc {
                     _ => return error_msg(&call.id, RpcError::UnavailableIndex),
                 };
             }
-            let result = match &call.params {
-                Params::Banner => Ok(json!(self.banner)),
-                Params::BlockHeader(args) => self.block_header(*args),
-                Params::BlockHeaders(args) => self.block_headers(*args),
-                Params::Donation => Ok(Value::Null),
-                Params::EstimateFee(args) => self.estimate_fee(*args),
-                Params::Features => self.features(),
-                Params::HeadersSubscribe => self.headers_subscribe(client),
-                Params::MempoolFeeHistogram => self.get_fee_histogram(),
-                Params::PeersSubscribe => Ok(json!([])),
-                Params::Ping => Ok(Value::Null),
-                Params::RelayFee => self.relayfee(),
-                Params::ScriptHashGetBalance(args) => self.scripthash_get_balance(client, args),
-                Params::ScriptHashGetHistory(args) => self.scripthash_get_history(client, args),
-                Params::ScriptHashListUnspent(args) => self.scripthash_list_unspent(client, args),
-                Params::ScriptHashSubscribe(args) => self.scripthash_subscribe(client, args),
-                Params::ScriptHashUnsubscribe(args) => self.scripthash_unsubscribe(client, args),
-                Params::TransactionBroadcast(args) => self.transaction_broadcast(args),
-                Params::TransactionGet(args) => self.transaction_get(args),
-                Params::TransactionGetMerkle(args) => self.transaction_get_merkle(args),
-                Params::TransactionFromPosition(args) => self.transaction_from_pos(*args),
-                Params::Version(args) => self.version(args),
+            let result = match call.method.as_str() {
+                "server.banner" => Ok(json!(self.banner)),
+                "blockchain.block.header" => {
+                    match parse_params::<u32>(&call.params) {
+                        Ok(height) => self.block_header((height as usize,)),
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.block.headers" => {
+                    match parse_params::<(u32, u32)>(&call.params) {
+                        Ok((start_height, count)) => self.block_headers((start_height as usize, count as usize)),
+                        Err(e) => Err(e),
+                    }
+                },
+                "server.donation_address" => Ok(Value::Null),
+                "blockchain.estimatefee" => {
+                    match parse_params::<u16>(&call.params) {
+                        Ok(blocks) => self.estimate_fee((blocks,)),
+                        Err(e) => Err(e),
+                    }
+                },
+                "server.features" => self.features(),
+                "blockchain.headers.subscribe" => self.headers_subscribe(client),
+                "mempool.get_fee_histogram" => self.get_fee_histogram(),
+                "server.peers.subscribe" => Ok(json!([])),
+                "server.ping" => Ok(Value::Null),
+                "blockchain.relayfee" => self.relayfee(),
+                "blockchain.scripthash.get_balance" => {
+                    match parse_params::<ScriptHash>(&call.params) {
+                        Ok(script_hash) => {
+                            let sh = script_hash.clone();
+                            self.scripthash_get_balance(client, &(sh,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.scripthash.get_history" => {
+                    match parse_params::<ScriptHash>(&call.params) {
+                        Ok(script_hash) => {
+                            let sh = script_hash.clone();
+                            self.scripthash_get_history(client, &(sh,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.scripthash.listunspent" => {
+                    match parse_params::<ScriptHash>(&call.params) {
+                        Ok(script_hash) => {
+                            let sh = script_hash.clone();
+                            self.scripthash_list_unspent(client, &(sh,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.scripthash.subscribe" => {
+                    match parse_params::<ScriptHash>(&call.params) {
+                        Ok(script_hash) => {
+                            let sh = script_hash.clone();
+                            self.scripthash_subscribe(client, &(sh,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.scripthash.unsubscribe" => {
+                    match parse_params::<ScriptHash>(&call.params) {
+                        Ok(script_hash) => {
+                            let sh = script_hash.clone();
+                            self.scripthash_unsubscribe(client, &(sh,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.transaction.broadcast" => {
+                    match parse_params::<String>(&call.params) {
+                        Ok(tx_hex) => {
+                            let tx = tx_hex.to_string();
+                            self.transaction_broadcast(&(tx,))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.transaction.get" => {
+                    match parse_params::<TxGetArgs>(&call.params) {
+                        Ok(args) => self.transaction_get(&args),
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.transaction.get_merkle" => {
+                    match parse_params::<(Txid, u32)>(&call.params) {
+                        Ok((txid, height)) => {
+                            self.transaction_get_merkle(&(txid, height as usize))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "blockchain.transaction.id_from_pos" => {
+                    match parse_params::<(u32, u32, bool)>(&call.params) {
+                        Ok((height, tx_pos, merkle)) => {
+                            self.transaction_from_pos((height as usize, tx_pos as usize, merkle))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                "server.version" => {
+                    match parse_params::<VersionRequest>(&call.params) {
+                        Ok(client_id) => {
+                            let id = client_id.to_string();
+                            let client_version = VersionRequest::Single("1.4".to_string());
+                            self.version(&(id, client_version))
+                        },
+                        Err(e) => Err(e),
+                    }
+                },
+                _ => {
+                    Err(anyhow::anyhow!("unknown method: {}", call.method))
+                }
             };
+            
             call.response(result)
         })
     }
@@ -752,70 +906,120 @@ impl Rpc {
                     }
                     
                     let result = match call.method.as_str() {
-                        // 根据方法名解析参数
+                        "server.banner" => Ok(json!(self.banner)),
                         "blockchain.block.header" => {
-                            let height: usize = parse_params(&call.params)?;
-                            self.block_header((height,))
+                            match parse_params::<u32>(&call.params) {
+                                Ok(height) => self.block_header((height as usize,)),
+                                Err(e) => Err(e),
+                            }
                         },
                         "blockchain.block.headers" => {
-                            let args: (usize, usize) = parse_params(&call.params)?;
-                            self.block_headers(args)
+                            match parse_params::<(u32, u32)>(&call.params) {
+                                Ok((start_height, count)) => self.block_headers((start_height as usize, count as usize)),
+                                Err(e) => Err(e),
+                            }
                         },
-                        "blockchain.estimatefee" => {
-                            let blocks: u16 = parse_params(&call.params)?;
-                            self.estimate_fee((blocks,))
-                        },
-                        "blockchain.headers.subscribe" => self.headers_subscribe(client),
-                        "blockchain.relayfee" => self.relayfee(),
-                        "blockchain.scripthash.get_balance" => {
-                            let script_hash: ScriptHash = parse_params(&call.params)?;
-                            self.scripthash_get_balance(client, &(script_hash,))
-                        },
-                        "blockchain.scripthash.get_history" => {
-                            let script_hash: ScriptHash = parse_params(&call.params)?;
-                            self.scripthash_get_history(client, &(script_hash,))
-                        },
-                        "blockchain.scripthash.listunspent" => {
-                            let script_hash: ScriptHash = parse_params(&call.params)?;
-                            self.scripthash_list_unspent(client, &(script_hash,))
-                        },
-                        "blockchain.scripthash.subscribe" => {
-                            let script_hash: ScriptHash = parse_params(&call.params)?;
-                            self.scripthash_subscribe(client, &(script_hash,))
-                        },
-                        "blockchain.scripthash.unsubscribe" => {
-                            let script_hash: ScriptHash = parse_params(&call.params)?;
-                            self.scripthash_unsubscribe(client, &(script_hash,))
-                        },
-                        "blockchain.transaction.broadcast" => {
-                            let tx_hex: String = parse_params(&call.params)?;
-                            self.transaction_broadcast(&(tx_hex,))
-                        },
-                        "blockchain.transaction.get" => {
-                            let args: TxGetArgs = parse_params(&call.params)?;
-                            self.transaction_get(&args)
-                        },
-                        "blockchain.transaction.get_merkle" => {
-                            let args: (Txid, usize) = parse_params(&call.params)?;
-                            self.transaction_get_merkle(&args)
-                        },
-                        "blockchain.transaction.id_from_pos" => {
-                            let args: (usize, usize, bool) = parse_params(&call.params)?;
-                            self.transaction_from_pos(args)
-                        },
-                        "mempool.get_fee_histogram" => self.get_fee_histogram(),
-                        "server.banner" => Ok(json!(self.banner)),
                         "server.donation_address" => Ok(Value::Null),
+                        "blockchain.estimatefee" => {
+                            match parse_params::<u16>(&call.params) {
+                                Ok(blocks) => self.estimate_fee((blocks,)),
+                                Err(e) => Err(e),
+                            }
+                        },
                         "server.features" => self.features(),
+                        "blockchain.headers.subscribe" => self.headers_subscribe(client),
+                        "mempool.get_fee_histogram" => self.get_fee_histogram(),
                         "server.peers.subscribe" => Ok(json!([])),
                         "server.ping" => Ok(Value::Null),
+                        "blockchain.relayfee" => self.relayfee(),
+                        "blockchain.scripthash.get_balance" => {
+                            match parse_params::<ScriptHash>(&call.params) {
+                                Ok(script_hash) => {
+                                    let sh = script_hash.clone();
+                                    self.scripthash_get_balance(client, &(sh,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.scripthash.get_history" => {
+                            match parse_params::<ScriptHash>(&call.params) {
+                                Ok(script_hash) => {
+                                    let sh = script_hash.clone();
+                                    self.scripthash_get_history(client, &(sh,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.scripthash.listunspent" => {
+                            match parse_params::<ScriptHash>(&call.params) {
+                                Ok(script_hash) => {
+                                    let sh = script_hash.clone();
+                                    self.scripthash_list_unspent(client, &(sh,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.scripthash.subscribe" => {
+                            match parse_params::<ScriptHash>(&call.params) {
+                                Ok(script_hash) => {
+                                    let sh = script_hash.clone();
+                                    self.scripthash_subscribe(client, &(sh,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.scripthash.unsubscribe" => {
+                            match parse_params::<ScriptHash>(&call.params) {
+                                Ok(script_hash) => {
+                                    let sh = script_hash.clone();
+                                    self.scripthash_unsubscribe(client, &(sh,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.transaction.broadcast" => {
+                            match parse_params::<String>(&call.params) {
+                                Ok(tx_hex) => {
+                                    let tx = tx_hex.to_string();
+                                    self.transaction_broadcast(&(tx,))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.transaction.get" => {
+                            match parse_params::<TxGetArgs>(&call.params) {
+                                Ok(args) => self.transaction_get(&args),
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.transaction.get_merkle" => {
+                            match parse_params::<(Txid, u32)>(&call.params) {
+                                Ok((txid, height)) => {
+                                    self.transaction_get_merkle(&(txid, height as usize))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
+                        "blockchain.transaction.id_from_pos" => {
+                            match parse_params::<(u32, u32, bool)>(&call.params) {
+                                Ok((height, tx_pos, merkle)) => {
+                                    self.transaction_from_pos((height as usize, tx_pos as usize, merkle))
+                                },
+                                Err(e) => Err(e),
+                            }
+                        },
                         "server.version" => {
-                            let client_id: String = parse_params(&call.params)?;
-                            let client_version = VersionRequest::Single("1.4".to_string());
-                            self.version(&(client_id, client_version))
+                            match parse_params::<VersionRequest>(&call.params) {
+                                Ok(client_id) => {
+                                    let id = client_id.to_string();
+                                    let client_version = VersionRequest::Single("1.4".to_string());
+                                    self.version(&(id, client_version))
+                                },
+                                Err(e) => Err(e),
+                            }
                         },
                         _ => {
-                            bail!("unknown method: {}", call.method);
+                            Err(anyhow::anyhow!("unknown method: {}", call.method))
                         }
                     };
                     
@@ -845,70 +1049,120 @@ impl Rpc {
                             }
                             
                             let result = match call.method.as_str() {
-                                // 根据方法名解析参数
+                                "server.banner" => Ok(json!(self.banner)),
                                 "blockchain.block.header" => {
-                                    let height: usize = parse_params(&call.params)?;
-                                    self.block_header((height,))
+                                    match parse_params::<u32>(&call.params) {
+                                        Ok(height) => self.block_header((height as usize,)),
+                                        Err(e) => Err(e),
+                                    }
                                 },
                                 "blockchain.block.headers" => {
-                                    let args: (usize, usize) = parse_params(&call.params)?;
-                                    self.block_headers(args)
+                                    match parse_params::<(u32, u32)>(&call.params) {
+                                        Ok((start_height, count)) => self.block_headers((start_height as usize, count as usize)),
+                                        Err(e) => Err(e),
+                                    }
                                 },
-                                "blockchain.estimatefee" => {
-                                    let blocks: u16 = parse_params(&call.params)?;
-                                    self.estimate_fee((blocks,))
-                                },
-                                "blockchain.headers.subscribe" => self.headers_subscribe(client),
-                                "blockchain.relayfee" => self.relayfee(),
-                                "blockchain.scripthash.get_balance" => {
-                                    let script_hash: ScriptHash = parse_params(&call.params)?;
-                                    self.scripthash_get_balance(client, &(script_hash,))
-                                },
-                                "blockchain.scripthash.get_history" => {
-                                    let script_hash: ScriptHash = parse_params(&call.params)?;
-                                    self.scripthash_get_history(client, &(script_hash,))
-                                },
-                                "blockchain.scripthash.listunspent" => {
-                                    let script_hash: ScriptHash = parse_params(&call.params)?;
-                                    self.scripthash_list_unspent(client, &(script_hash,))
-                                },
-                                "blockchain.scripthash.subscribe" => {
-                                    let script_hash: ScriptHash = parse_params(&call.params)?;
-                                    self.scripthash_subscribe(client, &(script_hash,))
-                                },
-                                "blockchain.scripthash.unsubscribe" => {
-                                    let script_hash: ScriptHash = parse_params(&call.params)?;
-                                    self.scripthash_unsubscribe(client, &(script_hash,))
-                                },
-                                "blockchain.transaction.broadcast" => {
-                                    let tx_hex: String = parse_params(&call.params)?;
-                                    self.transaction_broadcast(&(tx_hex,))
-                                },
-                                "blockchain.transaction.get" => {
-                                    let args: TxGetArgs = parse_params(&call.params)?;
-                                    self.transaction_get(&args)
-                                },
-                                "blockchain.transaction.get_merkle" => {
-                                    let args: (Txid, usize) = parse_params(&call.params)?;
-                                    self.transaction_get_merkle(&args)
-                                },
-                                "blockchain.transaction.id_from_pos" => {
-                                    let args: (usize, usize, bool) = parse_params(&call.params)?;
-                                    self.transaction_from_pos(args)
-                                },
-                                "mempool.get_fee_histogram" => self.get_fee_histogram(),
-                                "server.banner" => Ok(json!(self.banner)),
                                 "server.donation_address" => Ok(Value::Null),
+                                "blockchain.estimatefee" => {
+                                    match parse_params::<u16>(&call.params) {
+                                        Ok(blocks) => self.estimate_fee((blocks,)),
+                                        Err(e) => Err(e),
+                                    }
+                                },
                                 "server.features" => self.features(),
+                                "blockchain.headers.subscribe" => self.headers_subscribe(client),
+                                "mempool.get_fee_histogram" => self.get_fee_histogram(),
                                 "server.peers.subscribe" => Ok(json!([])),
                                 "server.ping" => Ok(Value::Null),
+                                "blockchain.relayfee" => self.relayfee(),
+                                "blockchain.scripthash.get_balance" => {
+                                    match parse_params::<ScriptHash>(&call.params) {
+                                        Ok(script_hash) => {
+                                            let sh = script_hash.clone();
+                                            self.scripthash_get_balance(client, &(sh,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.scripthash.get_history" => {
+                                    match parse_params::<ScriptHash>(&call.params) {
+                                        Ok(script_hash) => {
+                                            let sh = script_hash.clone();
+                                            self.scripthash_get_history(client, &(sh,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.scripthash.listunspent" => {
+                                    match parse_params::<ScriptHash>(&call.params) {
+                                        Ok(script_hash) => {
+                                            let sh = script_hash.clone();
+                                            self.scripthash_list_unspent(client, &(sh,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.scripthash.subscribe" => {
+                                    match parse_params::<ScriptHash>(&call.params) {
+                                        Ok(script_hash) => {
+                                            let sh = script_hash.clone();
+                                            self.scripthash_subscribe(client, &(sh,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.scripthash.unsubscribe" => {
+                                    match parse_params::<ScriptHash>(&call.params) {
+                                        Ok(script_hash) => {
+                                            let sh = script_hash.clone();
+                                            self.scripthash_unsubscribe(client, &(sh,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.transaction.broadcast" => {
+                                    match parse_params::<String>(&call.params) {
+                                        Ok(tx_hex) => {
+                                            let tx = tx_hex.to_string();
+                                            self.transaction_broadcast(&(tx,))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.transaction.get" => {
+                                    match parse_params::<TxGetArgs>(&call.params) {
+                                        Ok(args) => self.transaction_get(&args),
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.transaction.get_merkle" => {
+                                    match parse_params::<(Txid, u32)>(&call.params) {
+                                        Ok((txid, height)) => {
+                                            self.transaction_get_merkle(&(txid, height as usize))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
+                                "blockchain.transaction.id_from_pos" => {
+                                    match parse_params::<(u32, u32, bool)>(&call.params) {
+                                        Ok((height, tx_pos, merkle)) => {
+                                            self.transaction_from_pos((height as usize, tx_pos as usize, merkle))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                },
                                 "server.version" => {
-                                    let client_id: String = parse_params(&call.params)?;
-                                    let client_version = VersionRequest::Single("1.4".to_string());
-                                    self.version(&(client_id, client_version))
+                                    match parse_params::<VersionRequest>(&call.params) {
+                                        Ok(client_id) => {
+                                            let id = client_id.to_string();
+                                            let client_version = VersionRequest::Single("1.4".to_string());
+                                            self.version(&(id, client_version))
+                                        },
+                                        Err(e) => Err(e),
+                                    }
                                 },
                                 _ => {
-                                    bail!("unknown method: {}", call.method);
+                                    Err(anyhow::anyhow!("unknown method: {}", call.method))
                                 }
                             };
                             
@@ -935,16 +1189,16 @@ enum Params {
     PeersSubscribe,
     Ping,
     RelayFee,
-    ScriptHashGetBalance(&'static ScriptHash),
-    ScriptHashGetHistory(&'static ScriptHash),
-    ScriptHashListUnspent(&'static ScriptHash),
-    ScriptHashSubscribe(&'static ScriptHash),
-    ScriptHashUnsubscribe(&'static ScriptHash),
-    TransactionBroadcast(&'static str),
-    TransactionGet(&'static TxGetArgs),
-    TransactionGetMerkle(&'static (Txid, u32)),
-    TransactionFromPosition(TransactionPositionArgs),
-    Version(&'static VersionRequest),
+    ScriptHashGetBalance(ScriptHash),
+    ScriptHashGetHistory(ScriptHash),
+    ScriptHashListUnspent(ScriptHash),
+    ScriptHashSubscribe(ScriptHash),
+    ScriptHashUnsubscribe(ScriptHash),
+    TransactionBroadcast(String),
+    TransactionGet(TxGetArgs),
+    TransactionGetMerkle((Txid, u32)),
+    TransactionFromPosition((u32, u32, bool)),
+    Version(VersionRequest),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1063,7 +1317,7 @@ fn check_request(call: &Call) -> Result<()> {
         return Ok(());
     }
     
-    bail!("method not found: {}", call.method);
+    Err(anyhow::anyhow!("method not found: {}", call.method))
 }
 
 #[derive(Debug)]
