@@ -22,6 +22,7 @@ use crate::atomicals::state::AtomicalsState;
 use crate::atomicals::protocol::{AtomicalId, AtomicalOperation};
 use crate::atomicals::metrics::{WebSocketMetrics, LatencyType, ErrorType};
 use crate::atomicals::rpc::AtomicalInfo;
+use crate::atomicals::AtomicalType;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CompressionLevel {
@@ -748,6 +749,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{sleep, Duration};
     use warp::test::WsClient;
+    use crate::atomicals::AtomicalType;
 
     fn create_test_config() -> WebSocketConfig {
         WebSocketConfig {

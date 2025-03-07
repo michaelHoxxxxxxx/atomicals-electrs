@@ -88,7 +88,7 @@ impl AtomicalsState {
         
         Ok(AtomicalInfo {
             id: id.clone(),
-            owner: Address::from_script(&output.output.script_pubkey, self.network)
+            owner: Address::from_script(&output.owner.script_pubkey, self.network)
                 .ok()
                 .map(|addr| addr.to_string()),
             metadata: metadata_value,
@@ -98,7 +98,7 @@ impl AtomicalsState {
                 "FT" => AtomicalType::FT,
                 _ => AtomicalType::Unknown,
             }.to_string(),
-            value: output.output.value.to_sat(),
+            value: output.owner.value,
             created_height: output.height,
             created_timestamp: output.timestamp,
             sealed: is_sealed,
@@ -121,9 +121,11 @@ impl AtomicalsState {
             match operation {
                 AtomicalOperation::Mint { id, atomical_type, metadata } => {
                     let output = AtomicalOutput {
-                        txid: tx.compute_txid(),
-                        vout: 0, // 假设铸造操作总是在第一个输出
-                        output: tx.output[0].clone(),
+                        owner: OwnerInfo {
+                            script_pubkey: tx.output[0].script_pubkey.clone(),
+                            value: tx.output[0].value.to_sat(),
+                        },
+                        atomical_id: id.clone(),
                         metadata: metadata.clone().unwrap_or(serde_json::json!({})),
                         height,
                         timestamp,
@@ -133,7 +135,9 @@ impl AtomicalsState {
                             _ => "Unknown".to_string(),
                         },
                         sealed: false,
-                        atomical_id: id.clone(),
+                        txid: tx.compute_txid(),
+                        vout: 0, // 假设铸造操作总是在第一个输出
+                        output: tx.output[0].clone(),
                     };
                     
                     self.outputs.write().await.insert(id.clone(), output.clone());
@@ -160,9 +164,15 @@ impl AtomicalsState {
                 }
                 AtomicalOperation::Transfer { id, output_index } => {
                     if let Some(output) = self.outputs.write().await.get_mut(&id) {
-                        output.output = tx.output[output_index as usize].clone();
+                        output.owner = OwnerInfo {
+                            script_pubkey: tx.output[output_index as usize].script_pubkey.clone(),
+                            value: tx.output[output_index as usize].value.to_sat(),
+                        };
                         output.height = height;
                         output.timestamp = timestamp;
+                        output.txid = tx.compute_txid();
+                        output.vout = output_index;
+                        output.output = tx.output[output_index as usize].clone();
                     }
                     
                     self.notify_ownership_change(&id, &tx.output[output_index as usize]).await?;
@@ -297,12 +307,11 @@ impl AtomicalsState {
     pub fn add_atomical(&self, atomical_id: &AtomicalId, atomical_type: AtomicalType) -> Result<()> {
         // 创建默认的 AtomicalOutput
         let output = AtomicalOutput {
-            txid: atomical_id.txid,
-            vout: atomical_id.vout,
-            output: TxOut {
-                value: bitcoin::Amount::from_sat(0),
+            owner: OwnerInfo {
                 script_pubkey: bitcoin::Script::new().into(),
+                value: 0,
             },
+            atomical_id: atomical_id.clone(),
             metadata: serde_json::json!({}),
             height: 0,
             timestamp: 0,
@@ -312,7 +321,12 @@ impl AtomicalsState {
                 _ => "Unknown".to_string(),
             },
             sealed: false,
-            atomical_id: atomical_id.clone(),
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: bitcoin::Script::new().into(),
+            },
         };
         
         // 存储到 outputs
@@ -348,17 +362,65 @@ impl AtomicalsState {
     }
 }
 
+/// Atomicals 状态接口，用于测试中的 mock 实现
+pub trait AtomicalsStateInterface {
+    /// 检查 Atomical 是否存在
+    fn exists(&self, id: &AtomicalId) -> Result<bool>;
+    
+    /// 检查 Atomical 是否被封印
+    fn is_sealed(&self, id: &AtomicalId) -> Result<bool>;
+    
+    /// 创建 Atomical
+    fn create(&mut self, id: &AtomicalId, atomical_type: AtomicalType) -> Result<()>;
+    
+    /// 封印 Atomical
+    fn seal(&mut self, id: &AtomicalId) -> Result<()>;
+    
+    /// 获取 Atomical 类型
+    fn get_atomical_type(&self, id: &AtomicalId) -> Result<AtomicalType>;
+}
+
+impl AtomicalsStateInterface for AtomicalsState {
+    fn exists(&self, id: &AtomicalId) -> Result<bool> {
+        self.exists(id)
+    }
+    
+    fn is_sealed(&self, id: &AtomicalId) -> Result<bool> {
+        self.is_sealed(id)
+    }
+    
+    fn create(&mut self, id: &AtomicalId, atomical_type: AtomicalType) -> Result<()> {
+        self.add_atomical(id, atomical_type)
+    }
+    
+    fn seal(&mut self, id: &AtomicalId) -> Result<()> {
+        self.seal_atomical(id)
+    }
+    
+    fn get_atomical_type(&self, id: &AtomicalId) -> Result<AtomicalType> {
+        let info = self.get_atomical_info(id)?;
+        Ok(info.atomical_type)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerInfo {
+    pub script_pubkey: bitcoin::Script,
+    pub value: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtomicalOutput {
-    pub txid: bitcoin::Txid,
-    pub vout: u32,
-    pub output: TxOut,
-    pub metadata: Value,
+    pub owner: OwnerInfo,
+    pub atomical_id: AtomicalId,
+    pub metadata: Option<Value>,
     pub height: u32,
     pub timestamp: u64,
     pub atomical_type: String,
     pub sealed: bool,
-    pub atomical_id: AtomicalId,
+    pub txid: bitcoin::Txid,
+    pub vout: u32,
+    pub output: TxOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,18 +507,22 @@ mod tests {
 
         // 添加 Atomical
         let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: bitcoin::Script::new().into(),
+                value: 1000,
+            },
+            atomical_id: atomical_id.clone(),
+            metadata: serde_json::json!({}),
+            height: 0,
+            timestamp: 0,
+            atomical_type: "NFT".to_string(),
+            sealed: false,
             txid: atomical_id.txid,
             vout: atomical_id.vout,
             output: TxOut {
                 value: Amount::from_sat(1000).to_sat(),
                 script_pubkey: Builder::new().into_script(),
             },
-            metadata: serde_json::json!({}),
-            height: 0,
-            timestamp: 0,
-            atomical_type: "NFT".to_string(),
-            sealed: false,
-            atomical_id: atomical_id.clone(),
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
 
@@ -495,12 +561,11 @@ mod tests {
 
         // 添加输出
         let output = AtomicalOutput {
-            txid: atomical_id.txid,
-            vout: atomical_id.vout,
-            output: TxOut {
-                value: Amount::from_sat(1000).to_sat(),
-                script_pubkey: Builder::new().into_script(),
+            owner: OwnerInfo {
+                script_pubkey: bitcoin::Script::new().into(),
+                value: 1000,
             },
+            atomical_id: atomical_id.clone(),
             metadata: serde_json::json!({
                 "name": "Test NFT",
                 "description": "Test Description"
@@ -509,13 +574,18 @@ mod tests {
             timestamp: 1234567890,
             atomical_type: "NFT".to_string(),
             sealed: false,
-            atomical_id: atomical_id.clone(),
+            txid: atomical_id.txid,
+            vout: atomical_id.vout,
+            output: TxOut {
+                value: Amount::from_sat(1000).to_sat(),
+                script_pubkey: Builder::new().into_script(),
+            },
         };
         state.outputs.write().await.insert(atomical_id.clone(), output.clone());
 
         // 测试获取存在的输出
         let retrieved_output = state.get_output(&atomical_id).await?.unwrap();
-        assert_eq!(retrieved_output.output.value, 1000);
+        assert_eq!(retrieved_output.owner.value, 1000);
         assert_eq!(retrieved_output.height, 100);
         assert_eq!(retrieved_output.timestamp, 1234567890);
         Ok(())
@@ -541,18 +611,22 @@ mod tests {
             }
         });
         let output = AtomicalOutput {
+            owner: OwnerInfo {
+                script_pubkey: bitcoin::Script::new().into(),
+                value: 1000,
+            },
+            atomical_id: atomical_id.clone(),
+            metadata: metadata.clone(),
+            height: 0,
+            timestamp: 0,
+            atomical_type: "NFT".to_string(),
+            sealed: false,
             txid: atomical_id.txid,
             vout: atomical_id.vout,
             output: TxOut {
                 value: Amount::from_sat(1000).to_sat(),
                 script_pubkey: Builder::new().into_script(),
             },
-            metadata: metadata.clone(),
-            height: 0,
-            timestamp: 0,
-            atomical_type: "NFT".to_string(),
-            sealed: false,
-            atomical_id: atomical_id.clone(),
         };
         state.outputs.write().await.insert(atomical_id.clone(), output);
         state.metadata.write().await.insert(atomical_id.clone(), metadata);

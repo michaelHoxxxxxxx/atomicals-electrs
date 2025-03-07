@@ -336,10 +336,13 @@ mod tests {
         config.websocket_port = Some(8081);
 
         // 创建服务器
-        let server = Server::new(config)?;
+        let server = std::sync::Arc::new(Server::new(config)?);
         
         // 启动服务器
-        let server_handle = tokio::spawn(server.run());
+        let server_clone = server.clone();
+        let server_handle = tokio::spawn(async move {
+            server_clone.run().await
+        });
         
         // 等待服务器启动
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

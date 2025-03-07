@@ -5,11 +5,11 @@ use std::str::FromStr;
 use anyhow::{anyhow, Result};
 use bitcoin::{Address, Network, Transaction, Txid};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::atomicals::{
     AtomicalId, AtomicalOperation, AtomicalType, AtomicalsState,
-    storage::AtomicalsStorage,
+    storage::AtomicalsStorage, state::{AtomicalOutput, OwnerInfo},
 };
 
 /// Atomical 信息
@@ -289,10 +289,10 @@ mod tests {
         let operations = vec![
             AtomicalOperation::Mint {
                 atomical_type: AtomicalType::NFT,
-                metadata: json!({"name": "Test NFT 1"}),
+                metadata: Some(json!({"name": "Test NFT 1"})),
             },
             AtomicalOperation::Update {
-                atomical_id: id.clone(),
+                id: id.clone(),
                 metadata: json!({"name": "Updated NFT"}),
             },
         ];
@@ -312,13 +312,13 @@ mod tests {
         match &pending[&txid][0] {
             AtomicalOperation::Mint { atomical_type, metadata } => {
                 assert_eq!(*atomical_type, AtomicalType::NFT);
-                assert_eq!(metadata["name"], "Test NFT 1");
+                assert_eq!(metadata.as_ref().unwrap()["name"], "Test NFT 1");
             }
             _ => panic!("Expected Mint operation"),
         }
 
         match &pending[&txid][1] {
-            AtomicalOperation::Update { atomical_id, metadata } => {
+            AtomicalOperation::Update { id: atomical_id, metadata } => {
                 assert_eq!(*atomical_id, id);
                 assert_eq!(metadata["name"], "Updated NFT");
             }

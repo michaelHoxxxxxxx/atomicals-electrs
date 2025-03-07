@@ -161,6 +161,8 @@ mod tests {
     use bitcoin::consensus::deserialize;
     use bitcoin::Network::Regtest;
     use hex_lit::hex;
+    use std::sync::Arc;
+    use crate::AtomicalsState;
 
     #[test]
     fn test_genesis() {

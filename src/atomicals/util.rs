@@ -29,7 +29,8 @@ pub fn hash_data(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::hex::{FromHex, ToHex};
+    use bitcoin::hashes::hex::FromHex;
+    use hex::ToHex;
     use bitcoin::script::Builder;
 
     #[test]
