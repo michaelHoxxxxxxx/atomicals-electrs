@@ -144,6 +144,57 @@ pub enum AtomicalOperation {
         /// Output indices and amounts
         outputs: Vec<(u32, u64)>,
     },
+    /// Create a DFT subdomain
+    CreateSubdomain {
+        /// Subdomain name
+        name: String,
+        /// Parent domain ID (optional)
+        parent_id: Option<AtomicalId>,
+        /// Optional metadata
+        metadata: Option<serde_json::Value>,
+    },
+    /// Create a DFT container
+    CreateContainer {
+        /// Container ID
+        id: AtomicalId,
+        /// Container name
+        name: String,
+        /// Optional metadata
+        metadata: Option<serde_json::Value>,
+    },
+    /// Add DFT to a subdomain
+    AddToSubdomain {
+        /// DFT ID
+        dft_id: AtomicalId,
+        /// Subdomain name
+        subdomain_name: String,
+    },
+    /// Add DFT to a container
+    AddToContainer {
+        /// DFT ID
+        dft_id: AtomicalId,
+        /// Container ID
+        container_id: AtomicalId,
+    },
+    /// Remove DFT from a subdomain
+    RemoveFromSubdomain {
+        /// DFT ID
+        dft_id: AtomicalId,
+        /// Subdomain name
+        subdomain_name: String,
+    },
+    /// Remove DFT from a container
+    RemoveFromContainer {
+        /// DFT ID
+        dft_id: AtomicalId,
+        /// Container ID
+        container_id: AtomicalId,
+    },
+    /// Seal a container
+    SealContainer {
+        /// Container ID
+        container_id: AtomicalId,
+    },
 }
 
 impl AtomicalOperation {
@@ -178,332 +229,355 @@ impl AtomicalOperation {
             Ok(s) => s,
             Err(_) => return None,
         };
-        
         offset += op_len;
-
-        // 根据操作类型解析不同的操作
+        
+        // 解析操作数据
         match op_type {
-            "nft" => {
-                // 解析 NFT 铸造操作
+            "mint" => {
+                // 解析 Atomical ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析 Atomical 类型
                 if offset >= data.len() {
                     return None;
                 }
                 
-                // 解析元数据
-                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => Some(value),
-                    Err(_) => None,
-                };
+                let type_len = data[offset] as usize;
+                offset += 1;
                 
-                // 创建一个临时 ID (将在后续处理中被替换)
-                let id = AtomicalId {
-                    txid: Txid::all_zeros(),
-                    vout: 0,
-                };
-                
-                Some(Self::Mint {
-                    id,
-                    atomical_type: AtomicalType::NFT,
-                    metadata,
-                })
-            },
-            "ft" => {
-                // 解析 FT 铸造操作
-                if offset >= data.len() {
+                if offset + type_len > data.len() {
                     return None;
                 }
                 
-                // 解析元数据
-                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => Some(value),
-                    Err(_) => None,
-                };
-                
-                // 创建一个临时 ID (将在后续处理中被替换)
-                let id = AtomicalId {
-                    txid: Txid::all_zeros(),
-                    vout: 0,
-                };
-                
-                Some(Self::Mint {
-                    id,
-                    atomical_type: AtomicalType::FT,
-                    metadata,
-                })
-            },
-            "dft" => {
-                // 解析分布式铸造代币部署操作
-                if offset >= data.len() {
-                    return None;
-                }
-                
-                // 解析 DFT 数据
-                let dft_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
-                    Err(_) => return None,
-                };
-                
-                // 提取必要字段
-                let ticker = match dft_data.get("ticker") {
-                    Some(t) => match t.as_str() {
-                        Some(s) => s.to_string(),
-                        None => return None,
+                let atomical_type = match std::str::from_utf8(&data[offset..offset + type_len]) {
+                    Ok(s) => match AtomicalType::from_str(s) {
+                        Ok(t) => t,
+                        Err(_) => return None,
                     },
-                    None => return None,
-                };
-                
-                let max_supply = match dft_data.get("max_supply") {
-                    Some(s) => match s.as_u64() {
-                        Some(n) => n,
-                        None => return None,
-                    },
-                    None => return None,
-                };
-                
-                let metadata = dft_data.get("meta").cloned();
-                
-                // 创建一个临时 ID (将在后续处理中被替换)
-                let id = AtomicalId {
-                    txid: Txid::all_zeros(),
-                    vout: 0,
-                };
-                
-                Some(Self::DeployDFT {
-                    id,
-                    ticker,
-                    max_supply,
-                    metadata,
-                })
-            },
-            "dmt" => {
-                // 解析分布式铸造代币铸造操作
-                if offset >= data.len() {
-                    return None;
-                }
-                
-                // 解析 DMT 数据
-                let dmt_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
                     Err(_) => return None,
                 };
+                offset += type_len;
                 
-                // 提取父 Atomical ID
-                let parent_id_str = match dmt_data.get("parent_id") {
-                    Some(p) => match p.as_str() {
-                        Some(s) => s,
-                        None => return None,
-                    },
-                    None => return None,
-                };
-                
-                // 解析父 ID 字符串
-                let parts: Vec<&str> = parent_id_str.split(':').collect();
-                if parts.len() != 2 {
-                    return None;
-                }
-                
-                let txid = match Txid::from_str(parts[0]) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                let vout = match parts[1].parse::<u32>() {
-                    Ok(v) => v,
-                    Err(_) => return None,
-                };
-                
-                let parent_id = AtomicalId { txid, vout };
-                
-                // 提取铸造数量
-                let amount = match dmt_data.get("amount") {
-                    Some(a) => match a.as_u64() {
-                        Some(n) => n,
-                        None => return None,
-                    },
-                    None => return None,
-                };
-                
-                Some(Self::MintDFT {
-                    parent_id,
-                    amount,
-                })
-            },
-            "mod" => {
-                // 解析更新操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                offset += 4;
-                
-                let id = AtomicalId { txid, vout };
-                
-                // 解析元数据
-                let metadata = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
-                    Err(_) => return None,
-                };
-                
-                Some(Self::Update {
-                    id,
-                    metadata,
-                })
-            },
-            "sl" => {
-                // 解析封印操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                let id = AtomicalId { txid, vout };
-                
-                Some(Self::Seal { id })
-            },
-            "evt" => {
-                // 解析事件操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                offset += 4;
-                
-                let id = AtomicalId { txid, vout };
-                
-                // 解析事件数据
-                let data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
-                    Err(_) => return None,
-                };
-                
-                Some(Self::Event { id, data })
-            },
-            "dat" => {
-                // 解析数据存储操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                offset += 4;
-                
-                let id = AtomicalId { txid, vout };
-                
-                // 解析数据
-                let data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
-                    Err(_) => return None,
-                };
-                
-                Some(Self::Data { id, data })
-            },
-            "x" => {
-                // 解析提取操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                let id = AtomicalId { txid, vout };
-                
-                Some(Self::Extract { id })
-            },
-            "y" => {
-                // 解析分割操作
-                if offset + 36 > data.len() {
-                    return None;
-                }
-                
-                // 解析 Atomical ID
-                let txid_bytes = &data[offset..offset + 32];
-                let txid = match Txid::from_slice(txid_bytes) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                
-                offset += 32;
-                
-                let vout_bytes = &data[offset..offset + 4];
-                let vout = u32::from_le_bytes([vout_bytes[0], vout_bytes[1], vout_bytes[2], vout_bytes[3]]);
-                
-                offset += 4;
-                
-                let id = AtomicalId { txid, vout };
-                
-                // 解析输出信息
-                let outputs_data = match serde_json::from_slice::<serde_json::Value>(&data[offset..]) {
-                    Ok(value) => value,
-                    Err(_) => return None,
-                };
-                
-                let mut outputs = Vec::new();
-                
-                if let Some(outputs_array) = outputs_data.as_array() {
-                    for output in outputs_array {
-                        if let (Some(idx), Some(amount)) = (output.get(0).and_then(|v| v.as_u64()), output.get(1).and_then(|v| v.as_u64())) {
-                            outputs.push((idx as u32, amount));
-                        }
+                // 解析元数据（如果有）
+                let metadata = if offset < data.len() {
+                    match serde_json::from_slice(&data[offset..]) {
+                        Ok(v) => Some(v),
+                        Err(_) => None,
                     }
+                } else {
+                    None
+                };
+                
+                Some(Self::Mint {
+                    id: AtomicalId { txid, vout },
+                    atomical_type,
+                    metadata,
+                })
+            },
+            "transfer" => {
+                // 解析 Atomical ID
+                if offset + 36 > data.len() {
+                    return None;
                 }
                 
-                Some(Self::Split { id, outputs })
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析目标输出索引
+                if offset + 4 > data.len() {
+                    return None;
+                }
+                
+                let output_index = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                
+                Some(Self::Transfer {
+                    id: AtomicalId { txid, vout },
+                    output_index,
+                })
+            },
+            "create_subdomain" => {
+                // 解析子领域名称
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                let name_len = data[offset] as usize;
+                offset += 1;
+                
+                if offset + name_len > data.len() {
+                    return None;
+                }
+                
+                let name = match std::str::from_utf8(&data[offset..offset + name_len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return None,
+                };
+                offset += name_len;
+                
+                // 解析可选的父域ID
+                let parent_id = if offset < data.len() && data[offset] != 0 {
+                    if offset + 37 > data.len() {
+                        return None;
+                    }
+                    
+                    offset += 1; // 跳过标志位
+                    
+                    let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                        Ok(id) => id,
+                        Err(_) => return None,
+                    };
+                    offset += 32;
+                    
+                    let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                    offset += 4;
+                    
+                    Some(AtomicalId { txid, vout })
+                } else {
+                    if offset < data.len() {
+                        offset += 1; // 跳过标志位
+                    }
+                    None
+                };
+                
+                // 解析可选的元数据
+                let metadata = if offset < data.len() {
+                    match serde_json::from_slice(&data[offset..]) {
+                        Ok(value) => Some(value),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                
+                Some(Self::CreateSubdomain {
+                    name,
+                    parent_id,
+                    metadata,
+                })
+            },
+            "create_container" => {
+                // 解析容器ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析容器名称
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                let name_len = data[offset] as usize;
+                offset += 1;
+                
+                if offset + name_len > data.len() {
+                    return None;
+                }
+                
+                let name = match std::str::from_utf8(&data[offset..offset + name_len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return None,
+                };
+                offset += name_len;
+                
+                // 解析可选的元数据
+                let metadata = if offset < data.len() {
+                    match serde_json::from_slice(&data[offset..]) {
+                        Ok(value) => Some(value),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                
+                Some(Self::CreateContainer {
+                    id: AtomicalId { txid, vout },
+                    name,
+                    metadata,
+                })
+            },
+            "add_to_subdomain" => {
+                // 解析DFT ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析子领域名称
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                let name_len = data[offset] as usize;
+                offset += 1;
+                
+                if offset + name_len > data.len() {
+                    return None;
+                }
+                
+                let subdomain_name = match std::str::from_utf8(&data[offset..offset + name_len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return None,
+                };
+                
+                Some(Self::AddToSubdomain {
+                    dft_id: AtomicalId { txid, vout },
+                    subdomain_name,
+                })
+            },
+            "add_to_container" => {
+                // 解析DFT ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析容器ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let container_txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let container_vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                
+                Some(Self::AddToContainer {
+                    dft_id: AtomicalId { txid, vout },
+                    container_id: AtomicalId { txid: container_txid, vout: container_vout },
+                })
+            },
+            "remove_from_subdomain" => {
+                // 解析DFT ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析子领域名称
+                if offset >= data.len() {
+                    return None;
+                }
+                
+                let name_len = data[offset] as usize;
+                offset += 1;
+                
+                if offset + name_len > data.len() {
+                    return None;
+                }
+                
+                let subdomain_name = match std::str::from_utf8(&data[offset..offset + name_len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return None,
+                };
+                
+                Some(Self::RemoveFromSubdomain {
+                    dft_id: AtomicalId { txid, vout },
+                    subdomain_name,
+                })
+            },
+            "remove_from_container" => {
+                // 解析DFT ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                offset += 4;
+                
+                // 解析容器ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let container_txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let container_vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                
+                Some(Self::RemoveFromContainer {
+                    dft_id: AtomicalId { txid, vout },
+                    container_id: AtomicalId { txid: container_txid, vout: container_vout },
+                })
+            },
+            "seal_container" => {
+                // 解析容器ID
+                if offset + 36 > data.len() {
+                    return None;
+                }
+                
+                let txid = match Txid::from_slice(&data[offset..offset + 32]) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                offset += 32;
+                
+                let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                
+                Some(Self::SealContainer {
+                    container_id: AtomicalId { txid, vout },
+                })
             },
             _ => None,
         }
@@ -522,6 +596,13 @@ impl AtomicalOperation {
             Self::Data { .. } => "data",
             Self::Extract { .. } => "extract",
             Self::Split { .. } => "split",
+            Self::CreateSubdomain { .. } => "create_subdomain",
+            Self::CreateContainer { .. } => "create_container",
+            Self::AddToSubdomain { .. } => "add_to_subdomain",
+            Self::AddToContainer { .. } => "add_to_container",
+            Self::RemoveFromSubdomain { .. } => "remove_from_subdomain",
+            Self::RemoveFromContainer { .. } => "remove_from_container",
+            Self::SealContainer { .. } => "seal_container",
         }
     }
 
@@ -573,6 +654,41 @@ impl AtomicalOperation {
     /// Check if the operation is a split operation
     pub fn is_split(&self) -> bool {
         matches!(self, Self::Split { .. })
+    }
+    
+    /// Check if the operation is a create subdomain operation
+    pub fn is_create_subdomain(&self) -> bool {
+        matches!(self, Self::CreateSubdomain { .. })
+    }
+    
+    /// Check if the operation is a create container operation
+    pub fn is_create_container(&self) -> bool {
+        matches!(self, Self::CreateContainer { .. })
+    }
+    
+    /// Check if the operation is an add to subdomain operation
+    pub fn is_add_to_subdomain(&self) -> bool {
+        matches!(self, Self::AddToSubdomain { .. })
+    }
+    
+    /// Check if the operation is an add to container operation
+    pub fn is_add_to_container(&self) -> bool {
+        matches!(self, Self::AddToContainer { .. })
+    }
+    
+    /// Check if the operation is a remove from subdomain operation
+    pub fn is_remove_from_subdomain(&self) -> bool {
+        matches!(self, Self::RemoveFromSubdomain { .. })
+    }
+    
+    /// Check if the operation is a remove from container operation
+    pub fn is_remove_from_container(&self) -> bool {
+        matches!(self, Self::RemoveFromContainer { .. })
+    }
+    
+    /// Check if the operation is a seal container operation
+    pub fn is_seal_container(&self) -> bool {
+        matches!(self, Self::SealContainer { .. })
     }
 }
 
@@ -913,6 +1029,33 @@ mod tests {
                 id: atomical_id,
                 outputs: vec![(0, 10), (1, 20)],
             },
+            AtomicalOperation::CreateSubdomain {
+                name: "test_subdomain".to_string(),
+                parent_id: None,
+                metadata: None,
+            },
+            AtomicalOperation::CreateContainer {
+                id: atomical_id,
+                name: "test_container".to_string(),
+                metadata: None,
+            },
+            AtomicalOperation::AddToSubdomain {
+                dft_id: atomical_id,
+                subdomain_name: "test_subdomain".to_string(),
+            },
+            AtomicalOperation::AddToContainer {
+                dft_id: atomical_id,
+                container_id: atomical_id,
+            },
+            AtomicalOperation::RemoveFromSubdomain {
+                dft_id: atomical_id,
+                subdomain_name: "test_subdomain".to_string(),
+            },
+            AtomicalOperation::RemoveFromContainer {
+                dft_id: atomical_id,
+                container_id: atomical_id,
+            },
+            AtomicalOperation::SealContainer { container_id: atomical_id },
         ];
 
         // 验证每个操作的类型检查方法是互斥的
@@ -929,6 +1072,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Transfer { .. } => {
                     assert!(!op.is_mint());
@@ -941,6 +1091,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Update { .. } => {
                     assert!(!op.is_mint());
@@ -953,6 +1110,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Seal { .. } => {
                     assert!(!op.is_mint());
@@ -965,6 +1129,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::DeployDFT { .. } => {
                     assert!(!op.is_mint());
@@ -977,6 +1148,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::MintDFT { .. } => {
                     assert!(!op.is_mint());
@@ -989,6 +1167,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Event { .. } => {
                     assert!(!op.is_mint());
@@ -1001,6 +1186,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Data { .. } => {
                     assert!(!op.is_mint());
@@ -1013,6 +1205,13 @@ mod tests {
                     assert!(op.is_data());
                     assert!(!op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Extract { .. } => {
                     assert!(!op.is_mint());
@@ -1025,6 +1224,13 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(op.is_extract());
                     assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
                 }
                 AtomicalOperation::Split { .. } => {
                     assert!(!op.is_mint());
@@ -1037,8 +1243,424 @@ mod tests {
                     assert!(!op.is_data());
                     assert!(!op.is_extract());
                     assert!(op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::CreateSubdomain { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::CreateContainer { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::AddToSubdomain { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::AddToContainer { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::RemoveFromSubdomain { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::RemoveFromContainer { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(op.is_remove_from_container());
+                    assert!(!op.is_seal_container());
+                }
+                AtomicalOperation::SealContainer { .. } => {
+                    assert!(!op.is_mint());
+                    assert!(!op.is_transfer());
+                    assert!(!op.is_update());
+                    assert!(!op.is_seal());
+                    assert!(!op.is_deploy_dft());
+                    assert!(!op.is_mint_dft());
+                    assert!(!op.is_event());
+                    assert!(!op.is_data());
+                    assert!(!op.is_extract());
+                    assert!(!op.is_split());
+                    assert!(!op.is_create_subdomain());
+                    assert!(!op.is_create_container());
+                    assert!(!op.is_add_to_subdomain());
+                    assert!(!op.is_add_to_container());
+                    assert!(!op.is_remove_from_subdomain());
+                    assert!(!op.is_remove_from_container());
+                    assert!(op.is_seal_container());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_create_subdomain_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(16); // 操作类型长度
+        data.extend_from_slice(b"create_subdomain");
+        
+        // 子领域名称
+        data.push(7); // 名称长度
+        data.extend_from_slice(b"testdft");
+        
+        // 父域ID标志（无父域）
+        data.push(0);
+        
+        // 元数据
+        let metadata = r#"{"description":"Test Subdomain"}"#;
+        data.extend_from_slice(metadata.as_bytes());
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::CreateSubdomain { name, parent_id, metadata } => {
+                assert_eq!(name, "testdft");
+                assert!(parent_id.is_none());
+                assert!(metadata.is_some());
+                if let Some(meta) = metadata {
+                    assert_eq!(meta["description"], "Test Subdomain");
+                }
+            },
+            _ => panic!("Expected CreateSubdomain operation"),
+        }
+        
+        // 测试带父域ID的情况
+        let mut data_with_parent = Vec::new();
+        data_with_parent.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data_with_parent.push(16); // 操作类型长度
+        data_with_parent.extend_from_slice(b"create_subdomain");
+        
+        // 子领域名称
+        data_with_parent.push(7); // 名称长度
+        data_with_parent.extend_from_slice(b"testdft");
+        
+        // 父域ID标志（有父域）
+        data_with_parent.push(1);
+        
+        // 父域ID
+        let parent_txid = [0u8; 32];
+        data_with_parent.extend_from_slice(&parent_txid);
+        data_with_parent.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 解析操作
+        let operation_with_parent = AtomicalOperation::from_tx_data(&data_with_parent).unwrap();
+        
+        // 验证结果
+        match operation_with_parent {
+            AtomicalOperation::CreateSubdomain { name, parent_id, metadata } => {
+                assert_eq!(name, "testdft");
+                assert!(parent_id.is_some());
+                assert!(metadata.is_none());
+            },
+            _ => panic!("Expected CreateSubdomain operation with parent_id"),
+        }
+    }
+
+    #[test]
+    fn test_create_container_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(16); // 操作类型长度
+        data.extend_from_slice(b"create_container");
+        
+        // 容器ID
+        let container_txid = [0u8; 32];
+        data.extend_from_slice(&container_txid);
+        data.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 容器名称
+        data.push(10); // 名称长度
+        data.extend_from_slice(b"testcontainer");
+        
+        // 元数据
+        let metadata = r#"{"description":"Test Container"}"#;
+        data.extend_from_slice(metadata.as_bytes());
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::CreateContainer { id, name, metadata } => {
+                assert_eq!(id.txid, Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()));
+                assert_eq!(id.vout, 0);
+                assert_eq!(name, "testcontainer");
+                assert!(metadata.is_some());
+                if let Some(meta) = metadata {
+                    assert_eq!(meta["description"], "Test Container");
+                }
+            },
+            _ => panic!("Expected CreateContainer operation"),
+        }
+    }
+
+    #[test]
+    fn test_add_to_subdomain_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(15); // 操作类型长度
+        data.extend_from_slice(b"add_to_subdomain");
+        
+        // DFT ID
+        let dft_txid = [0u8; 32];
+        data.extend_from_slice(&dft_txid);
+        data.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 子领域名称
+        data.push(7); // 名称长度
+        data.extend_from_slice(b"testdft");
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::AddToSubdomain { dft_id, subdomain_name } => {
+                assert_eq!(dft_id.txid, Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()));
+                assert_eq!(dft_id.vout, 0);
+                assert_eq!(subdomain_name, "testdft");
+            },
+            _ => panic!("Expected AddToSubdomain operation"),
+        }
+    }
+
+    #[test]
+    fn test_add_to_container_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(15); // 操作类型长度
+        data.extend_from_slice(b"add_to_container");
+        
+        // DFT ID
+        let dft_txid = [0u8; 32];
+        data.extend_from_slice(&dft_txid);
+        data.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 容器ID
+        let container_txid = [1u8; 32];
+        data.extend_from_slice(&container_txid);
+        data.extend_from_slice(&[0, 0, 0, 1]); // vout
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::AddToContainer { dft_id, container_id } => {
+                assert_eq!(dft_id.txid, Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()));
+                assert_eq!(dft_id.vout, 0);
+                assert_eq!(container_id.txid, Txid::from_slice(&[1u8; 32]).unwrap());
+                assert_eq!(container_id.vout, 1);
+            },
+            _ => panic!("Expected AddToContainer operation"),
+        }
+    }
+
+    #[test]
+    fn test_remove_from_subdomain_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(20); // 操作类型长度
+        data.extend_from_slice(b"remove_from_subdomain");
+        
+        // DFT ID
+        let dft_txid = [0u8; 32];
+        data.extend_from_slice(&dft_txid);
+        data.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 子领域名称
+        data.push(7); // 名称长度
+        data.extend_from_slice(b"testdft");
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::RemoveFromSubdomain { dft_id, subdomain_name } => {
+                assert_eq!(dft_id.txid, Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()));
+                assert_eq!(dft_id.vout, 0);
+                assert_eq!(subdomain_name, "testdft");
+            },
+            _ => panic!("Expected RemoveFromSubdomain operation"),
+        }
+    }
+
+    #[test]
+    fn test_remove_from_container_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(20); // 操作类型长度
+        data.extend_from_slice(b"remove_from_container");
+        
+        // DFT ID
+        let dft_txid = [0u8; 32];
+        data.extend_from_slice(&dft_txid);
+        data.extend_from_slice(&[0, 0, 0, 0]); // vout
+        
+        // 容器ID
+        let container_txid = [1u8; 32];
+        data.extend_from_slice(&container_txid);
+        data.extend_from_slice(&[0, 0, 0, 1]); // vout
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::RemoveFromContainer { dft_id, container_id } => {
+                assert_eq!(dft_id.txid, Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()));
+                assert_eq!(dft_id.vout, 0);
+                assert_eq!(container_id.txid, Txid::from_slice(&[1u8; 32]).unwrap());
+                assert_eq!(container_id.vout, 1);
+            },
+            _ => panic!("Expected RemoveFromContainer operation"),
+        }
+    }
+
+    #[test]
+    fn test_seal_container_operation() {
+        // 创建测试数据
+        let mut data = Vec::new();
+        data.extend_from_slice(b"atom");
+        
+        // 操作类型
+        data.push(14); // 操作类型长度
+        data.extend_from_slice(b"seal_container");
+        
+        // 容器ID
+        let container_txid = [1u8; 32];
+        data.extend_from_slice(&container_txid);
+        data.extend_from_slice(&[0, 0, 0, 1]); // vout
+        
+        // 解析操作
+        let operation = AtomicalOperation::from_tx_data(&data).unwrap();
+        
+        // 验证结果
+        match operation {
+            AtomicalOperation::SealContainer { container_id } => {
+                assert_eq!(container_id.txid, Txid::from_slice(&[1u8; 32]).unwrap());
+                assert_eq!(container_id.vout, 1);
+            },
+            _ => panic!("Expected SealContainer operation"),
         }
     }
 }

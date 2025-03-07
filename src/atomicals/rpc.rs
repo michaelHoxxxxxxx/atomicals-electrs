@@ -6,10 +6,12 @@ use anyhow::{anyhow, Result};
 use bitcoin::{Address, Network, Transaction, Txid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::RwLock;
 
 use crate::atomicals::{
     AtomicalId, AtomicalOperation, AtomicalType, AtomicalsState,
     storage::AtomicalsStorage, state::{AtomicalOutput, OwnerInfo},
+    dft::{DftManager, DftInfo, DftSupplyInfo, DftHolder, DftMintEvent, DftSubdomain, DftContainer},
 };
 
 /// Atomical 信息
@@ -40,6 +42,7 @@ pub struct AtomicalsRpc {
     state: Arc<AtomicalsState>,
     storage: Arc<AtomicalsStorage>,
     network: Network,
+    dft_manager: Arc<RwLock<DftManager>>,
 }
 
 impl AtomicalsRpc {
@@ -47,11 +50,13 @@ impl AtomicalsRpc {
         network: Network,
         state: Arc<AtomicalsState>,
         storage: Arc<AtomicalsStorage>,
+        dft_manager: Arc<RwLock<DftManager>>,
     ) -> Self {
         Self {
-            network,
             state,
             storage,
+            network,
+            dft_manager,
         }
     }
 
@@ -150,6 +155,251 @@ impl AtomicalsRpc {
             "total_sealed": self.state.get_sealed_count_sync()?,
         }))
     }
+
+    /// 获取 DFT 信息
+    pub async fn get_dft_info(&self, id: &AtomicalId) -> Result<DftInfo> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_dft_info(id)
+    }
+
+    /// 通过 ticker 获取 DFT 信息
+    pub async fn get_dft_info_by_ticker(&self, ticker: &str) -> Result<DftInfo> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_dft_info_by_ticker(ticker)
+    }
+
+    /// 获取 DFT 供应量信息
+    pub async fn get_dft_supply_info(&self, id: &AtomicalId) -> Result<DftSupplyInfo> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_supply_info(id)
+    }
+
+    /// 通过 ticker 获取 DFT 供应量信息
+    pub async fn get_dft_supply_info_by_ticker(&self, ticker: &str) -> Result<DftSupplyInfo> {
+        let dft_manager = self.dft_manager.read().await;
+        let id = dft_manager.get_dft_info_by_ticker(ticker)?.id;
+        dft_manager.get_supply_info(&id)
+    }
+
+    /// 获取 DFT 持有者列表
+    pub async fn get_dft_holders(&self, id: &AtomicalId) -> Result<Vec<DftHolder>> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_holders(id)
+    }
+
+    /// 通过 ticker 获取 DFT 持有者列表
+    pub async fn get_dft_holders_by_ticker(&self, ticker: &str) -> Result<Vec<DftHolder>> {
+        let dft_manager = self.dft_manager.read().await;
+        let id = dft_manager.get_dft_info_by_ticker(ticker)?.id;
+        dft_manager.get_holders(&id)
+    }
+
+    /// 获取 DFT 铸造历史
+    pub async fn get_dft_mint_history(&self, id: &AtomicalId) -> Result<Vec<DftMintEvent>> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_mint_history(id)
+    }
+
+    /// 通过 ticker 获取 DFT 铸造历史
+    pub async fn get_dft_mint_history_by_ticker(&self, ticker: &str) -> Result<Vec<DftMintEvent>> {
+        let dft_manager = self.dft_manager.read().await;
+        let id = dft_manager.get_dft_info_by_ticker(ticker)?.id;
+        dft_manager.get_mint_history(&id)
+    }
+
+    /// 获取所有 DFT 列表
+    pub async fn get_all_dfts(&self) -> Result<Vec<DftInfo>> {
+        let dft_manager = self.dft_manager.read().await;
+        Ok(dft_manager.get_all_dfts())
+    }
+
+    /// 获取 DFT 总数
+    pub async fn get_dft_count(&self) -> Result<usize> {
+        let dft_manager = self.dft_manager.read().await;
+        Ok(dft_manager.get_total_count())
+    }
+
+    /// 获取所有 DFT 子领域
+    pub async fn get_all_dft_subdomains(&self) -> Result<Vec<DftSubdomain>> {
+        let dft_manager = self.dft_manager.read().await;
+        Ok(dft_manager.get_all_subdomains())
+    }
+
+    /// 获取子领域信息
+    pub async fn get_dft_subdomain(&self, name: &str) -> Result<DftSubdomain> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_subdomain(name)
+    }
+
+    /// 获取子领域中的所有 DFT
+    pub async fn get_dfts_in_subdomain(&self, name: &str) -> Result<Vec<DftInfo>> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_dfts_in_subdomain(name)
+    }
+
+    /// 获取所有 DFT 容器
+    pub async fn get_all_dft_containers(&self) -> Result<Vec<DftContainer>> {
+        let dft_manager = self.dft_manager.read().await;
+        Ok(dft_manager.get_all_containers())
+    }
+
+    /// 获取容器信息
+    pub async fn get_dft_container(&self, id: &AtomicalId) -> Result<DftContainer> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_container(id)
+    }
+
+    /// 获取容器中的所有 DFT
+    pub async fn get_dfts_in_container(&self, id: &AtomicalId) -> Result<Vec<DftInfo>> {
+        let dft_manager = self.dft_manager.read().await;
+        dft_manager.get_dfts_in_container(id)
+    }
+
+    /// 获取所有事件元数据
+    pub async fn get_all_events(&self) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let events = dft_manager.get_all_events();
+        
+        let mut result = Vec::new();
+        for event in events {
+            result.push(serde_json::to_value(event)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取特定事件的元数据
+    pub async fn get_event(&self, id: &str) -> Result<serde_json::Value> {
+        let dft_manager = self.dft_manager.read().await;
+        let event = dft_manager.get_event(id)?;
+        
+        Ok(serde_json::to_value(event)?)
+    }
+    
+    /// 获取与特定 DFT 相关的事件
+    pub async fn get_events_by_dft(&self, dft_id: &AtomicalId) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let events = dft_manager.get_events_by_dft(dft_id);
+        
+        let mut result = Vec::new();
+        for event in events {
+            result.push(serde_json::to_value(event)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取与特定子领域相关的事件
+    pub async fn get_events_by_subdomain(&self, subdomain_name: &str) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let events = dft_manager.get_events_by_subdomain(subdomain_name);
+        
+        let mut result = Vec::new();
+        for event in events {
+            result.push(serde_json::to_value(event)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取与特定容器相关的事件
+    pub async fn get_events_by_container(&self, container_id: &AtomicalId) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let events = dft_manager.get_events_by_container(container_id);
+        
+        let mut result = Vec::new();
+        for event in events {
+            result.push(serde_json::to_value(event)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取特定类型的事件
+    pub async fn get_events_by_type(&self, event_type: &str) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let events = dft_manager.get_events_by_type(event_type);
+        
+        let mut result = Vec::new();
+        for event in events {
+            result.push(serde_json::to_value(event)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取所有数据操作元数据
+    pub async fn get_all_data(&self) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let data_operations = dft_manager.get_all_data();
+        
+        let mut result = Vec::new();
+        for data in data_operations {
+            result.push(serde_json::to_value(data)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取特定数据操作的元数据
+    pub async fn get_data(&self, id: &str) -> Result<serde_json::Value> {
+        let dft_manager = self.dft_manager.read().await;
+        let data = dft_manager.get_data(id)?;
+        
+        Ok(serde_json::to_value(data)?)
+    }
+    
+    /// 获取与特定 DFT 相关的数据
+    pub async fn get_data_by_dft(&self, dft_id: &AtomicalId) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let data_operations = dft_manager.get_data_by_dft(dft_id);
+        
+        let mut result = Vec::new();
+        for data in data_operations {
+            result.push(serde_json::to_value(data)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取与特定子领域相关的数据
+    pub async fn get_data_by_subdomain(&self, subdomain_name: &str) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let data_operations = dft_manager.get_data_by_subdomain(subdomain_name);
+        
+        let mut result = Vec::new();
+        for data in data_operations {
+            result.push(serde_json::to_value(data)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取与特定容器相关的数据
+    pub async fn get_data_by_container(&self, container_id: &AtomicalId) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let data_operations = dft_manager.get_data_by_container(container_id);
+        
+        let mut result = Vec::new();
+        for data in data_operations {
+            result.push(serde_json::to_value(data)?);
+        }
+        
+        Ok(result)
+    }
+    
+    /// 获取特定类型的数据
+    pub async fn get_data_by_type(&self, data_type: &str) -> Result<Vec<serde_json::Value>> {
+        let dft_manager = self.dft_manager.read().await;
+        let data_operations = dft_manager.get_data_by_type(data_type);
+        
+        let mut result = Vec::new();
+        for data in data_operations {
+            result.push(serde_json::to_value(data)?);
+        }
+        
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -164,7 +414,8 @@ mod tests {
         let network = Network::Regtest;
         let state = Arc::new(AtomicalsState::new());
         let storage = Arc::new(AtomicalsStorage::new_test().unwrap());
-        AtomicalsRpc::new(network, state, storage)
+        let dft_manager = Arc::new(RwLock::new(DftManager::new()));
+        AtomicalsRpc::new(network, state, storage, dft_manager)
     }
 
     fn create_test_atomical_id() -> AtomicalId {

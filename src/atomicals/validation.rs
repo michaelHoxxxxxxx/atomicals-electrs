@@ -349,6 +349,140 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
             // 这里可以添加更多的验证逻辑，例如检查是否超过最大供应量
             // 但这需要获取 Atomical 的更多信息，如最大供应量和当前已铸造数量
         }
+        AtomicalOperation::CreateSubdomain { name, parent_id, metadata } => {
+            // 验证创建子领域操作
+            // 检查子领域名称是否有效
+            if name.is_empty() {
+                return Err(anyhow!("Subdomain name cannot be empty"));
+            }
+            
+            // 名称只能包含字母、数字和连字符，且必须以字母开头
+            if !name.chars().next().unwrap().is_alphabetic() {
+                return Err(anyhow!("Subdomain name must start with a letter"));
+            }
+            
+            if !name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+                return Err(anyhow!("Subdomain name can only contain letters, numbers, and hyphens"));
+            }
+            
+            // 检查父域ID（如果有）
+            if let Some(parent_id) = parent_id {
+                if !state.exists(parent_id)? {
+                    return Err(anyhow!("Parent domain does not exist"));
+                }
+            }
+            
+            // 检查元数据（如果有）
+            if let Some(metadata) = metadata {
+                if metadata.as_object().is_none() {
+                    return Err(anyhow!("Metadata must be a JSON object"));
+                }
+            }
+        }
+        AtomicalOperation::CreateContainer { id, name, metadata } => {
+            // 验证创建容器操作
+            // 检查容器名称是否有效
+            if name.is_empty() {
+                return Err(anyhow!("Container name cannot be empty"));
+            }
+            
+            // 名称只能包含字母、数字和连字符，且必须以字母开头
+            if !name.chars().next().unwrap().is_alphabetic() {
+                return Err(anyhow!("Container name must start with a letter"));
+            }
+            
+            if !name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+                return Err(anyhow!("Container name can only contain letters, numbers, and hyphens"));
+            }
+            
+            // 检查容器ID是否已存在
+            if state.exists(id)? {
+                return Err(anyhow!("Container ID already exists"));
+            }
+            
+            // 检查元数据（如果有）
+            if let Some(metadata) = metadata {
+                if metadata.as_object().is_none() {
+                    return Err(anyhow!("Metadata must be a JSON object"));
+                }
+            }
+        }
+        AtomicalOperation::AddToSubdomain { dft_id, subdomain_name } => {
+            // 验证添加到子领域操作
+            // 检查DFT是否存在
+            if !state.exists(dft_id)? {
+                return Err(anyhow!("DFT does not exist"));
+            }
+            
+            // 检查子领域名称是否有效
+            if subdomain_name.is_empty() {
+                return Err(anyhow!("Subdomain name cannot be empty"));
+            }
+            
+            // 注意：由于接口限制，我们暂时跳过检查子领域是否存在的逻辑
+        }
+        AtomicalOperation::AddToContainer { dft_id, container_id } => {
+            // 验证添加到容器操作
+            // 检查DFT是否存在
+            if !state.exists(dft_id)? {
+                return Err(anyhow!("DFT does not exist"));
+            }
+            
+            // 检查容器是否存在
+            if !state.exists(container_id)? {
+                return Err(anyhow!("Container does not exist"));
+            }
+            
+            // 检查容器是否已封印
+            if state.is_sealed(container_id)? {
+                return Err(anyhow!("Cannot add to sealed container"));
+            }
+        }
+        AtomicalOperation::RemoveFromSubdomain { dft_id, subdomain_name } => {
+            // 验证从子领域移除操作
+            // 检查DFT是否存在
+            if !state.exists(dft_id)? {
+                return Err(anyhow!("DFT does not exist"));
+            }
+            
+            // 检查子领域名称是否有效
+            if subdomain_name.is_empty() {
+                return Err(anyhow!("Subdomain name cannot be empty"));
+            }
+            
+            // 注意：由于接口限制，我们暂时跳过检查子领域是否存在和DFT是否在子领域中的逻辑
+        }
+        AtomicalOperation::RemoveFromContainer { dft_id, container_id } => {
+            // 验证从容器移除操作
+            // 检查DFT是否存在
+            if !state.exists(dft_id)? {
+                return Err(anyhow!("DFT does not exist"));
+            }
+            
+            // 检查容器是否存在
+            if !state.exists(container_id)? {
+                return Err(anyhow!("Container does not exist"));
+            }
+            
+            // 检查容器是否已封印
+            if state.is_sealed(container_id)? {
+                return Err(anyhow!("Cannot remove from sealed container"));
+            }
+            
+            // 注意：由于接口限制，我们暂时跳过检查DFT是否在容器中的逻辑
+        }
+        AtomicalOperation::SealContainer { container_id } => {
+            // 验证封印容器操作
+            // 检查容器是否存在
+            if !state.exists(container_id)? {
+                return Err(anyhow!("Container does not exist"));
+            }
+            
+            // 检查容器是否已封印
+            if state.is_sealed(container_id)? {
+                return Err(anyhow!("Container is already sealed"));
+            }
+        }
     }
 
     Ok(())
@@ -429,7 +563,7 @@ fn validate_mint(atomical_type: &AtomicalType, metadata: &Option<Value>) -> Resu
                     return Err(anyhow!("Max supply must be greater than 0"));
                 }
                 
-                if max_supply > 21_000_000_000_000_000 { // 21 quadrillion
+                if max_supply > 21_000_000_000_000 { // 21 quadrillion
                     return Err(anyhow!("Max supply exceeds reasonable limit"));
                 }
             }

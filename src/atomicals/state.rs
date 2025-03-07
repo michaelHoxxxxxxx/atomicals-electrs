@@ -121,10 +121,7 @@ impl AtomicalsState {
             match operation {
                 AtomicalOperation::Mint { id, atomical_type, metadata } => {
                     let output = AtomicalOutput {
-                        owner: OwnerInfo {
-                            script_pubkey: tx.output[0].script_pubkey.clone(),
-                            value: tx.output[0].value.to_sat(),
-                        },
+                        owner: OwnerInfo::new(tx.output[0].script_pubkey.clone(), tx.output[0].value.to_sat(), height, timestamp),
                         atomical_id: id.clone(),
                         metadata: metadata.clone().unwrap_or(serde_json::json!({})),
                         height,
@@ -164,10 +161,7 @@ impl AtomicalsState {
                 }
                 AtomicalOperation::Transfer { id, output_index } => {
                     if let Some(output) = self.outputs.write().await.get_mut(&id) {
-                        output.owner = OwnerInfo {
-                            script_pubkey: tx.output[output_index as usize].script_pubkey.clone(),
-                            value: tx.output[output_index as usize].value.to_sat(),
-                        };
+                        output.owner.update(tx.output[output_index as usize].script_pubkey.clone(), tx.output[output_index as usize].value.to_sat(), height, timestamp, Some(tx.compute_txid()));
                         output.height = height;
                         output.timestamp = timestamp;
                         output.txid = tx.compute_txid();
@@ -307,10 +301,7 @@ impl AtomicalsState {
     pub fn add_atomical(&self, atomical_id: &AtomicalId, atomical_type: AtomicalType) -> Result<()> {
         // 创建默认的 AtomicalOutput
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: bitcoin::Script::new().into(),
-                value: 0,
-            },
+            owner: OwnerInfo::new(bitcoin::Script::new().into(), 0, 0, 0),
             atomical_id: atomical_id.clone(),
             metadata: serde_json::json!({}),
             height: 0,
@@ -407,6 +398,83 @@ impl AtomicalsStateInterface for AtomicalsState {
 pub struct OwnerInfo {
     pub script_pubkey: bitcoin::Script,
     pub value: u64,
+    /// 所有权获取时间戳
+    pub acquired_timestamp: u64,
+    /// 所有权获取区块高度
+    pub acquired_height: u32,
+    /// 前一个所有者的脚本（如果有）
+    pub previous_owner: Option<bitcoin::Script>,
+    /// 所有权历史记录
+    pub ownership_history: Vec<OwnershipHistoryEntry>,
+}
+
+/// 所有权历史记录条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnershipHistoryEntry {
+    /// 所有者脚本
+    pub script_pubkey: bitcoin::Script,
+    /// 获取时间戳
+    pub acquired_timestamp: u64,
+    /// 获取区块高度
+    pub acquired_height: u32,
+    /// 转移交易ID
+    pub transfer_txid: Option<bitcoin::Txid>,
+}
+
+impl OwnerInfo {
+    /// 创建新的所有权信息
+    pub fn new(script_pubkey: bitcoin::Script, value: u64, height: u32, timestamp: u64) -> Self {
+        Self {
+            script_pubkey,
+            value,
+            acquired_timestamp: timestamp,
+            acquired_height: height,
+            previous_owner: None,
+            ownership_history: Vec::new(),
+        }
+    }
+
+    /// 更新所有权信息
+    pub fn update(&mut self, new_script_pubkey: bitcoin::Script, new_value: u64, height: u32, timestamp: u64, txid: Option<bitcoin::Txid>) {
+        // 记录当前所有者到历史记录
+        let history_entry = OwnershipHistoryEntry {
+            script_pubkey: self.script_pubkey.clone(),
+            acquired_timestamp: self.acquired_timestamp,
+            acquired_height: self.acquired_height,
+            transfer_txid: txid,
+        };
+        
+        // 保存前一个所有者
+        self.previous_owner = Some(self.script_pubkey.clone());
+        
+        // 更新当前所有者信息
+        self.script_pubkey = new_script_pubkey;
+        self.value = new_value;
+        self.acquired_timestamp = timestamp;
+        self.acquired_height = height;
+        
+        // 添加到历史记录
+        self.ownership_history.push(history_entry);
+    }
+
+    /// 验证所有权
+    pub fn verify_ownership(&self, script: &bitcoin::Script) -> bool {
+        self.script_pubkey == *script
+    }
+
+    /// 获取所有权持有时间（以秒为单位）
+    pub fn get_holding_time(&self, current_timestamp: u64) -> u64 {
+        if current_timestamp > self.acquired_timestamp {
+            current_timestamp - self.acquired_timestamp
+        } else {
+            0
+        }
+    }
+
+    /// 获取所有权历史长度
+    pub fn get_ownership_changes_count(&self) -> usize {
+        self.ownership_history.len()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,10 +575,7 @@ mod tests {
 
         // 添加 Atomical
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: bitcoin::Script::new().into(),
-                value: 1000,
-            },
+            owner: OwnerInfo::new(bitcoin::Script::new().into(), 1000, 0, 0),
             atomical_id: atomical_id.clone(),
             metadata: serde_json::json!({}),
             height: 0,
@@ -561,10 +626,7 @@ mod tests {
 
         // 添加输出
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: bitcoin::Script::new().into(),
-                value: 1000,
-            },
+            owner: OwnerInfo::new(bitcoin::Script::new().into(), 1000, 0, 0),
             atomical_id: atomical_id.clone(),
             metadata: serde_json::json!({
                 "name": "Test NFT",
@@ -611,10 +673,7 @@ mod tests {
             }
         });
         let output = AtomicalOutput {
-            owner: OwnerInfo {
-                script_pubkey: bitcoin::Script::new().into(),
-                value: 1000,
-            },
+            owner: OwnerInfo::new(bitcoin::Script::new().into(), 1000, 0, 0),
             atomical_id: atomical_id.clone(),
             metadata: metadata.clone(),
             height: 0,
