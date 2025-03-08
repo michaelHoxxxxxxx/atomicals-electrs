@@ -199,21 +199,21 @@ pub enum AtomicalOperation {
 
 impl AtomicalOperation {
     /// Parse operation data from transaction
-    pub fn from_tx_data(data: &[u8]) -> Option<Self> {
+    pub fn from_tx_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 4 {
-            return None;
+            return Err("Invalid data length".to_string());
         }
 
         // 检查是否以 "atom" 开头
         if &data[0..4] != b"atom" {
-            return None;
+            return Err("Invalid magic bytes".to_string());
         }
 
         let mut offset = 4;
         
         // 解析操作类型
         if offset >= data.len() {
-            return None;
+            return Err("Invalid operation type length".to_string());
         }
 
         // 获取操作类型长度
@@ -221,13 +221,13 @@ impl AtomicalOperation {
         offset += 1;
         
         if offset + op_len > data.len() {
-            return None;
+            return Err("Invalid operation type".to_string());
         }
         
         // 获取操作类型字符串
         let op_type = match std::str::from_utf8(&data[offset..offset + op_len]) {
             Ok(s) => s,
-            Err(_) => return None,
+            Err(_) => return Err("Invalid operation type string".to_string()),
         };
         offset += op_len;
         
@@ -236,12 +236,12 @@ impl AtomicalOperation {
             "mint" => {
                 // 解析 Atomical ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid Atomical ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -250,22 +250,22 @@ impl AtomicalOperation {
                 
                 // 解析 Atomical 类型
                 if offset >= data.len() {
-                    return None;
+                    return Err("Invalid Atomical type length".to_string());
                 }
                 
                 let type_len = data[offset] as usize;
                 offset += 1;
                 
                 if offset + type_len > data.len() {
-                    return None;
+                    return Err("Invalid Atomical type".to_string());
                 }
                 
                 let atomical_type = match std::str::from_utf8(&data[offset..offset + type_len]) {
                     Ok(s) => match AtomicalType::from_str(s) {
                         Ok(t) => t,
-                        Err(_) => return None,
+                        Err(_) => return Err("Invalid Atomical type".to_string()),
                     },
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Atomical type string".to_string()),
                 };
                 offset += type_len;
                 
@@ -273,13 +273,13 @@ impl AtomicalOperation {
                 let metadata = if offset < data.len() {
                     match serde_json::from_slice(&data[offset..]) {
                         Ok(v) => Some(v),
-                        Err(_) => None,
+                        Err(_) => return Err("Invalid metadata".to_string()),
                     }
                 } else {
                     None
                 };
                 
-                Some(Self::Mint {
+                Ok(Self::Mint {
                     id: AtomicalId { txid, vout },
                     atomical_type,
                     metadata,
@@ -288,12 +288,12 @@ impl AtomicalOperation {
             "transfer" => {
                 // 解析 Atomical ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid Atomical ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -302,12 +302,12 @@ impl AtomicalOperation {
                 
                 // 解析目标输出索引
                 if offset + 4 > data.len() {
-                    return None;
+                    return Err("Invalid output index".to_string());
                 }
                 
                 let output_index = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
                 
-                Some(Self::Transfer {
+                Ok(Self::Transfer {
                     id: AtomicalId { txid, vout },
                     output_index,
                 })
@@ -315,33 +315,33 @@ impl AtomicalOperation {
             "create_subdomain" => {
                 // 解析子领域名称
                 if offset >= data.len() {
-                    return None;
+                    return Err("Invalid subdomain name length".to_string());
                 }
                 
                 let name_len = data[offset] as usize;
                 offset += 1;
                 
                 if offset + name_len > data.len() {
-                    return None;
+                    return Err("Invalid subdomain name".to_string());
                 }
                 
                 let name = match std::str::from_utf8(&data[offset..offset + name_len]) {
                     Ok(s) => s.to_string(),
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid subdomain name string".to_string()),
                 };
                 offset += name_len;
                 
                 // 解析可选的父域ID
                 let parent_id = if offset < data.len() && data[offset] != 0 {
                     if offset + 37 > data.len() {
-                        return None;
+                        return Err("Invalid parent ID".to_string());
                     }
                     
                     offset += 1; // 跳过标志位
                     
                     let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                         Ok(id) => id,
-                        Err(_) => return None,
+                        Err(_) => return Err("Invalid Txid".to_string()),
                     };
                     offset += 32;
                     
@@ -360,13 +360,13 @@ impl AtomicalOperation {
                 let metadata = if offset < data.len() {
                     match serde_json::from_slice(&data[offset..]) {
                         Ok(value) => Some(value),
-                        Err(_) => None,
+                        Err(_) => return Err("Invalid metadata".to_string()),
                     }
                 } else {
                     None
                 };
                 
-                Some(Self::CreateSubdomain {
+                Ok(Self::CreateSubdomain {
                     name,
                     parent_id,
                     metadata,
@@ -375,12 +375,12 @@ impl AtomicalOperation {
             "create_container" => {
                 // 解析容器ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid container ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -389,19 +389,19 @@ impl AtomicalOperation {
                 
                 // 解析容器名称
                 if offset >= data.len() {
-                    return None;
+                    return Err("Invalid container name length".to_string());
                 }
                 
                 let name_len = data[offset] as usize;
                 offset += 1;
                 
                 if offset + name_len > data.len() {
-                    return None;
+                    return Err("Invalid container name".to_string());
                 }
                 
                 let name = match std::str::from_utf8(&data[offset..offset + name_len]) {
                     Ok(s) => s.to_string(),
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid container name string".to_string()),
                 };
                 offset += name_len;
                 
@@ -409,13 +409,13 @@ impl AtomicalOperation {
                 let metadata = if offset < data.len() {
                     match serde_json::from_slice(&data[offset..]) {
                         Ok(value) => Some(value),
-                        Err(_) => None,
+                        Err(_) => return Err("Invalid metadata".to_string()),
                     }
                 } else {
                     None
                 };
                 
-                Some(Self::CreateContainer {
+                Ok(Self::CreateContainer {
                     id: AtomicalId { txid, vout },
                     name,
                     metadata,
@@ -424,12 +424,12 @@ impl AtomicalOperation {
             "add_to_subdomain" => {
                 // 解析DFT ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid DFT ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -438,22 +438,22 @@ impl AtomicalOperation {
                 
                 // 解析子领域名称
                 if offset >= data.len() {
-                    return None;
+                    return Err("Invalid subdomain name length".to_string());
                 }
                 
                 let name_len = data[offset] as usize;
                 offset += 1;
                 
                 if offset + name_len > data.len() {
-                    return None;
+                    return Err("Invalid subdomain name".to_string());
                 }
                 
                 let subdomain_name = match std::str::from_utf8(&data[offset..offset + name_len]) {
                     Ok(s) => s.to_string(),
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid subdomain name string".to_string()),
                 };
                 
-                Some(Self::AddToSubdomain {
+                Ok(Self::AddToSubdomain {
                     dft_id: AtomicalId { txid, vout },
                     subdomain_name,
                 })
@@ -461,12 +461,12 @@ impl AtomicalOperation {
             "add_to_container" => {
                 // 解析DFT ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid DFT ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -475,18 +475,18 @@ impl AtomicalOperation {
                 
                 // 解析容器ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid container ID".to_string());
                 }
                 
                 let container_txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
                 let container_vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
                 
-                Some(Self::AddToContainer {
+                Ok(Self::AddToContainer {
                     dft_id: AtomicalId { txid, vout },
                     container_id: AtomicalId { txid: container_txid, vout: container_vout },
                 })
@@ -494,12 +494,12 @@ impl AtomicalOperation {
             "remove_from_subdomain" => {
                 // 解析DFT ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid DFT ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -508,22 +508,22 @@ impl AtomicalOperation {
                 
                 // 解析子领域名称
                 if offset >= data.len() {
-                    return None;
+                    return Err("Invalid subdomain name length".to_string());
                 }
                 
                 let name_len = data[offset] as usize;
                 offset += 1;
                 
                 if offset + name_len > data.len() {
-                    return None;
+                    return Err("Invalid subdomain name".to_string());
                 }
                 
                 let subdomain_name = match std::str::from_utf8(&data[offset..offset + name_len]) {
                     Ok(s) => s.to_string(),
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid subdomain name string".to_string()),
                 };
                 
-                Some(Self::RemoveFromSubdomain {
+                Ok(Self::RemoveFromSubdomain {
                     dft_id: AtomicalId { txid, vout },
                     subdomain_name,
                 })
@@ -531,12 +531,12 @@ impl AtomicalOperation {
             "remove_from_container" => {
                 // 解析DFT ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid DFT ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
@@ -545,18 +545,18 @@ impl AtomicalOperation {
                 
                 // 解析容器ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid container ID".to_string());
                 }
                 
                 let container_txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
                 let container_vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
                 
-                Some(Self::RemoveFromContainer {
+                Ok(Self::RemoveFromContainer {
                     dft_id: AtomicalId { txid, vout },
                     container_id: AtomicalId { txid: container_txid, vout: container_vout },
                 })
@@ -564,22 +564,22 @@ impl AtomicalOperation {
             "seal_container" => {
                 // 解析容器ID
                 if offset + 36 > data.len() {
-                    return None;
+                    return Err("Invalid container ID".to_string());
                 }
                 
                 let txid = match Txid::from_slice(&data[offset..offset + 32]) {
                     Ok(id) => id,
-                    Err(_) => return None,
+                    Err(_) => return Err("Invalid Txid".to_string()),
                 };
                 offset += 32;
                 
                 let vout = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
                 
-                Some(Self::SealContainer {
+                Ok(Self::SealContainer {
                     container_id: AtomicalId { txid, vout },
                 })
             },
-            _ => None,
+            _ => Err("Unknown operation type".to_string()),
         }
     }
 
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn test_operation_from_tx_data() {
         // 测试空数据
-        assert!(AtomicalOperation::from_tx_data(&[]).is_none());
+        assert!(AtomicalOperation::from_tx_data(&[]).is_err());
 
         // TODO: 一旦实现了 from_tx_data，添加更多测试用例
         // 1. 测试有效的铸造操作数据

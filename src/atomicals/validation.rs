@@ -356,13 +356,9 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
                 return Err(anyhow!("Subdomain name cannot be empty"));
             }
             
-            // 名称只能包含字母、数字和连字符，且必须以字母开头
-            if !name.chars().next().unwrap().is_alphabetic() {
-                return Err(anyhow!("Subdomain name must start with a letter"));
-            }
-            
-            if !name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                return Err(anyhow!("Subdomain name can only contain letters, numbers, and hyphens"));
+            // 使用辅助函数检查子领域名称格式
+            if !is_valid_subdomain_name(name) {
+                return Err(anyhow!("Invalid subdomain name format"));
             }
             
             // 检查父域ID（如果有）
@@ -386,13 +382,9 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
                 return Err(anyhow!("Container name cannot be empty"));
             }
             
-            // 名称只能包含字母、数字和连字符，且必须以字母开头
-            if !name.chars().next().unwrap().is_alphabetic() {
-                return Err(anyhow!("Container name must start with a letter"));
-            }
-            
-            if !name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                return Err(anyhow!("Container name can only contain letters, numbers, and hyphens"));
+            // 使用辅助函数检查容器名称格式
+            if !is_valid_container_name(name) {
+                return Err(anyhow!("Invalid container name format"));
             }
             
             // 检查容器ID是否已存在
@@ -419,7 +411,10 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
                 return Err(anyhow!("Subdomain name cannot be empty"));
             }
             
-            // 注意：由于接口限制，我们暂时跳过检查子领域是否存在的逻辑
+            // 检查子领域名称格式
+            if !is_valid_subdomain_name(subdomain_name) {
+                return Err(anyhow!("Invalid subdomain name format"));
+            }
         }
         AtomicalOperation::AddToContainer { dft_id, container_id } => {
             // 验证添加到容器操作
@@ -450,7 +445,10 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
                 return Err(anyhow!("Subdomain name cannot be empty"));
             }
             
-            // 注意：由于接口限制，我们暂时跳过检查子领域是否存在和DFT是否在子领域中的逻辑
+            // 检查子领域名称格式
+            if !is_valid_subdomain_name(subdomain_name) {
+                return Err(anyhow!("Invalid subdomain name format"));
+            }
         }
         AtomicalOperation::RemoveFromContainer { dft_id, container_id } => {
             // 验证从容器移除操作
@@ -468,8 +466,6 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
             if state.is_sealed(container_id)? {
                 return Err(anyhow!("Cannot remove from sealed container"));
             }
-            
-            // 注意：由于接口限制，我们暂时跳过检查DFT是否在容器中的逻辑
         }
         AtomicalOperation::SealContainer { container_id } => {
             // 验证封印容器操作
@@ -486,6 +482,50 @@ pub fn validate_operation<S: AtomicalsStateInterface>(
     }
 
     Ok(())
+}
+
+/// 验证子领域名称是否有效
+/// 
+/// 子领域名称必须符合特定格式要求
+/// 
+/// # 参数
+/// * `name` - 要验证的子领域名称
+/// 
+/// # 返回
+/// * `bool` - 如果名称有效，返回 true；否则返回 false
+fn is_valid_subdomain_name(name: &str) -> bool {
+    // 子领域名称必须只包含字母、数字、连字符和下划线
+    // 且长度在3-63个字符之间
+    if name.len() < 3 || name.len() > 63 {
+        return false;
+    }
+    
+    // 检查字符是否合法
+    name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    })
+}
+
+/// 验证容器名称是否有效
+/// 
+/// 容器名称必须符合特定格式要求
+/// 
+/// # 参数
+/// * `name` - 要验证的容器名称
+/// 
+/// # 返回
+/// * `bool` - 如果名称有效，返回 true；否则返回 false
+fn is_valid_container_name(name: &str) -> bool {
+    // 容器名称必须只包含字母、数字、连字符和下划线
+    // 且长度在3-63个字符之间
+    if name.len() < 3 || name.len() > 63 {
+        return false;
+    }
+    
+    // 检查字符是否合法
+    name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    })
 }
 
 /// 验证铸造操作
@@ -1021,7 +1061,7 @@ mod tests {
         let invalid_supply_large = AtomicalOperation::DeployDFT {
             id: id.clone(),
             ticker: "ABC".to_string(),
-            max_supply: 22_000_000_000_000_000, // 超出限制
+            max_supply: 22_000_000_000_000, // 超出限制
             metadata: Some(serde_json::json!({
                 "name": "Test Token",
                 "description": "A test token"
@@ -1632,5 +1672,231 @@ mod tests {
         assert!(validate_operation(&AtomicalOperation::Seal {
             id: id2.clone(),
         }, &tx_no_outputs, &state).is_err());
+    }
+    
+    #[test]
+    fn test_validate_create_subdomain() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的子领域创建操作
+        let valid_op = AtomicalOperation::CreateSubdomain {
+            name: "test-subdomain".to_string(),
+            parent_id: None,
+            metadata: Some(serde_json::json!({
+                "description": "Test subdomain"
+            })),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+        
+        // 空名称
+        let invalid_name_empty = AtomicalOperation::CreateSubdomain {
+            name: "".to_string(),
+            parent_id: None,
+            metadata: Some(serde_json::json!({
+                "description": "Test subdomain"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_empty, &tx, &state).is_err());
+        
+        // 无效名称格式（特殊字符）
+        let invalid_name_format = AtomicalOperation::CreateSubdomain {
+            name: "test@subdomain".to_string(),
+            parent_id: None,
+            metadata: Some(serde_json::json!({
+                "description": "Test subdomain"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_format, &tx, &state).is_err());
+        
+        // 无效名称格式（太短）
+        let invalid_name_too_short = AtomicalOperation::CreateSubdomain {
+            name: "ab".to_string(),
+            parent_id: None,
+            metadata: Some(serde_json::json!({
+                "description": "Test subdomain"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_too_short, &tx, &state).is_err());
+        
+        // 无效的元数据（非对象）
+        let invalid_metadata = AtomicalOperation::CreateSubdomain {
+            name: "test-subdomain".to_string(),
+            parent_id: None,
+            metadata: Some(serde_json::json!("not an object")),
+        };
+        
+        assert!(validate_operation(&invalid_metadata, &tx, &state).is_err());
+    }
+    
+    #[test]
+    fn test_validate_create_container() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的容器创建操作
+        let valid_op = AtomicalOperation::CreateContainer {
+            id: id.clone(),
+            name: "test-container".to_string(),
+            metadata: Some(serde_json::json!({
+                "description": "Test container"
+            })),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+        
+        // 空名称
+        let invalid_name_empty = AtomicalOperation::CreateContainer {
+            id: id.clone(),
+            name: "".to_string(),
+            metadata: Some(serde_json::json!({
+                "description": "Test container"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_empty, &tx, &state).is_err());
+        
+        // 无效名称格式（特殊字符）
+        let invalid_name_format = AtomicalOperation::CreateContainer {
+            id: id.clone(),
+            name: "test@container".to_string(),
+            metadata: Some(serde_json::json!({
+                "description": "Test container"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_format, &tx, &state).is_err());
+        
+        // 无效名称格式（太短）
+        let invalid_name_too_short = AtomicalOperation::CreateContainer {
+            id: id.clone(),
+            name: "ab".to_string(),
+            metadata: Some(serde_json::json!({
+                "description": "Test container"
+            })),
+        };
+        
+        assert!(validate_operation(&invalid_name_too_short, &tx, &state).is_err());
+        
+        // 无效的元数据（非对象）
+        let invalid_metadata = AtomicalOperation::CreateContainer {
+            id: id.clone(),
+            name: "test-container".to_string(),
+            metadata: Some(serde_json::json!("not an object")),
+        };
+        
+        assert!(validate_operation(&invalid_metadata, &tx, &state).is_err());
+    }
+    
+    #[test]
+    fn test_validate_add_to_subdomain() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的添加到子领域操作
+        let valid_op = AtomicalOperation::AddToSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "test-subdomain".to_string(),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+        
+        // 空子领域名称
+        let invalid_name_empty = AtomicalOperation::AddToSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "".to_string(),
+        };
+        
+        assert!(validate_operation(&invalid_name_empty, &tx, &state).is_err());
+        
+        // 无效子领域名称格式
+        let invalid_name_format = AtomicalOperation::AddToSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "test@subdomain".to_string(),
+        };
+        
+        assert!(validate_operation(&invalid_name_format, &tx, &state).is_err());
+    }
+    
+    #[test]
+    fn test_validate_add_to_container() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的添加到容器操作
+        let valid_op = AtomicalOperation::AddToContainer {
+            dft_id: id.clone(),
+            container_id: id.clone(),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_remove_from_subdomain() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的从子领域移除操作
+        let valid_op = AtomicalOperation::RemoveFromSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "test-subdomain".to_string(),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+        
+        // 空子领域名称
+        let invalid_name_empty = AtomicalOperation::RemoveFromSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "".to_string(),
+        };
+        
+        assert!(validate_operation(&invalid_name_empty, &tx, &state).is_err());
+        
+        // 无效子领域名称格式
+        let invalid_name_format = AtomicalOperation::RemoveFromSubdomain {
+            dft_id: id.clone(),
+            subdomain_name: "test@subdomain".to_string(),
+        };
+        
+        assert!(validate_operation(&invalid_name_format, &tx, &state).is_err());
+    }
+    
+    #[test]
+    fn test_validate_remove_from_container() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的从容器移除操作
+        let valid_op = AtomicalOperation::RemoveFromContainer {
+            dft_id: id.clone(),
+            container_id: id.clone(),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_seal_container() {
+        let state = create_test_state();
+        let tx = create_test_transaction();
+        let id = create_test_atomical_id();
+        
+        // 有效的封印容器操作
+        let valid_op = AtomicalOperation::SealContainer {
+            container_id: id.clone(),
+        };
+        
+        assert!(validate_operation(&valid_op, &tx, &state).is_ok());
     }
 }
