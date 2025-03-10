@@ -1,10 +1,12 @@
-use anyhow::{Result, anyhow};
-use bitcoin::{Transaction, TxOut, OutPoint};
+use bitcoin::{Transaction, TxOut, OutPoint, Script, opcodes::all::OP_RETURN};
 use serde_json::Value;
 use log::{debug, warn, trace, error};
-use std::collections::HashMap;
+use std::collections::{HashMap};
+use fnv::FnvHashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use lru::LruCache;
+use rayon::prelude::*;
 
 use super::protocol::{AtomicalId, AtomicalOperation, AtomicalType};
 use super::state::{AtomicalsState, AtomicalOutput};
@@ -511,49 +513,87 @@ fn parse_batch_container_operations(script: &[u8], vout: u32) -> Result<Option<V
 #[derive(Debug)]
 pub struct TxParser {
     /// 缓存已解析的交易
-    cache: HashMap<bitcoin::Txid, Vec<AtomicalOperation>>,
+    cache: Mutex<LruCache<bitcoin::Txid, Arc<Vec<AtomicalOperation>>>>,
     /// 是否启用复杂交易解析
     enable_complex_parsing: bool,
     /// Atomicals状态引用，用于上下文感知解析
     atomicals_state: Option<Arc<AtomicalsState>>,
+    /// 快速路径标志：如果为true，对于没有Atomicals操作的交易会快速返回
+    enable_fast_path: bool,
+    /// 预分配的错误向量容量
+    error_capacity: usize,
+    /// 预分配的操作向量容量
+    operations_capacity: usize,
 }
 
 impl TxParser {
     /// 创建新的交易解析器
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: Mutex::new(LruCache::new(1000)), // 默认缓存1000个交易
             enable_complex_parsing: true,
             atomicals_state: None,
+            enable_fast_path: true,
+            error_capacity: 4,         // 预分配4个错误的空间
+            operations_capacity: 8,    // 预分配8个操作的空间
         }
     }
     
     /// 创建新的交易解析器，指定是否启用复杂交易解析
     pub fn new_with_options(enable_complex_parsing: bool) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: Mutex::new(LruCache::new(1000)), // 默认缓存1000个交易
             enable_complex_parsing,
             atomicals_state: None,
+            enable_fast_path: true,
+            error_capacity: 4,
+            operations_capacity: 8,
         }
     }
 
     /// 创建带有Atomicals状态的交易解析器，用于上下文感知解析
     pub fn new_with_state(atomicals_state: Arc<AtomicalsState>, enable_complex_parsing: bool) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: Mutex::new(LruCache::new(1000)), // 默认缓存1000个交易
             enable_complex_parsing,
             atomicals_state: Some(atomicals_state),
+            enable_fast_path: true,
+            error_capacity: 4,
+            operations_capacity: 8,
+        }
+    }
+    
+    /// 创建新的交易解析器，指定缓存大小和其他选项
+    pub fn new_with_cache_size(
+        cache_size: usize, 
+        enable_complex_parsing: bool,
+        enable_fast_path: bool,
+        error_capacity: usize,
+        operations_capacity: usize,
+    ) -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(cache_size)),
+            enable_complex_parsing,
+            atomicals_state: None,
+            enable_fast_path,
+            error_capacity,
+            operations_capacity,
         }
     }
     
     /// 清除缓存
     pub fn clear_cache(&mut self) {
-        self.cache.clear();
+        self.cache.lock().unwrap().clear();
     }
     
     /// 设置是否启用复杂交易解析
     pub fn set_enable_complex_parsing(&mut self, enable: bool) {
         self.enable_complex_parsing = enable;
+    }
+
+    /// 设置是否启用快速路径
+    pub fn set_enable_fast_path(&mut self, enable: bool) {
+        self.enable_fast_path = enable;
     }
 
     /// 设置Atomicals状态引用，用于上下文感知解析
@@ -564,8 +604,13 @@ impl TxParser {
     /// 解析交易中的 Atomicals 操作
     pub fn parse_transaction(&self, tx: &Transaction) -> Result<Vec<AtomicalOperation>, ParseError> {
         // 检查缓存
-        if let Some(operations) = self.cache.get(&tx.txid()) {
-            return Ok(operations.clone());
+        if let Some(operations) = self.cache.lock().unwrap().peek(&tx.txid()) {
+            return Ok(operations.as_ref().clone());
+        }
+        
+        // 快速路径：检查交易是否可能包含Atomicals操作
+        if self.enable_fast_path && !self.might_contain_atomicals(tx) {
+            return Ok(Vec::new());
         }
         
         // 如果有状态引用，使用上下文信息解析
@@ -573,11 +618,16 @@ impl TxParser {
             return self.parse_transaction_with_context(tx, state);
         }
         
-        let mut operations = Vec::new();
-        let mut errors = Vec::new();
+        let mut operations = Vec::with_capacity(self.operations_capacity);
+        let mut errors = Vec::with_capacity(self.error_capacity);
         
         // 解析每个输出
         for (vout, output) in tx.output.iter().enumerate() {
+            // 快速检查：如果脚本不可能包含Atomicals操作，跳过
+            if !self.script_might_contain_atomicals(&output.script_pubkey) {
+                continue;
+            }
+            
             // 尝试解析基本操作
             match parse_output(output, vout as u32) {
                 Ok(Some(op)) => {
@@ -633,9 +683,9 @@ impl TxParser {
         // 更新缓存
         if !operations.is_empty() {
             let txid = tx.txid();
-            let operations_clone = operations.clone();
-            let cache = &mut self.cache;
-            cache.insert(txid, operations_clone);
+            let operations_arc = Arc::new(operations.clone());
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(txid, operations_arc);
         }
         
         // 如果没有成功解析任何操作但有错误，返回第一个错误
@@ -650,9 +700,16 @@ impl TxParser {
 
     /// 使用上下文信息解析交易
     fn parse_transaction_with_context(&self, tx: &Transaction, state: &Arc<AtomicalsState>) -> Result<Vec<AtomicalOperation>, ParseError> {
-        let mut operations = Vec::new();
-        let mut errors = Vec::new();
-        let mut input_atomicals: HashMap<usize, Vec<AtomicalId>> = HashMap::new();
+        let mut operations = Vec::with_capacity(self.operations_capacity);
+        let mut errors = Vec::with_capacity(self.error_capacity);
+        
+        // 快速路径：检查交易是否可能包含Atomicals操作
+        if self.enable_fast_path && !self.might_contain_atomicals(tx) {
+            return Ok(Vec::new());
+        }
+        
+        // 使用FnvHashMap提高性能
+        let mut input_atomicals: FnvHashMap<usize, Vec<AtomicalId>> = FnvHashMap::default();
         
         // 第一步：分析交易输入，找出所有相关的Atomicals
         for (vin, input) in tx.input.iter().enumerate() {
@@ -671,6 +728,11 @@ impl TxParser {
         
         // 第二步：标准解析每个输出
         for (vout, output) in tx.output.iter().enumerate() {
+            // 快速检查：如果脚本不可能包含Atomicals操作，跳过
+            if !self.script_might_contain_atomicals(&output.script_pubkey) {
+                continue;
+            }
+            
             // 尝试解析基本操作
             match parse_output(output, vout as u32) {
                 Ok(Some(op)) => {
@@ -732,9 +794,9 @@ impl TxParser {
         // 更新缓存
         if !operations.is_empty() {
             let txid = tx.txid();
-            let operations_clone = operations.clone();
-            let cache = &mut self.cache;
-            cache.insert(txid, operations_clone);
+            let operations_arc = Arc::new(operations.clone());
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(txid, operations_arc);
         }
         
         // 如果没有成功解析任何操作但有错误，返回第一个错误
@@ -773,10 +835,10 @@ impl TxParser {
     fn infer_operations_from_inputs(
         &self,
         tx: &Transaction,
-        input_atomicals: &HashMap<usize, Vec<AtomicalId>>,
+        input_atomicals: &FnvHashMap<usize, Vec<AtomicalId>>,
         state: &Arc<AtomicalsState>,
     ) -> Vec<AtomicalOperation> {
-        let mut operations = Vec::new();
+        let mut operations = Vec::with_capacity(input_atomicals.values().map(|v| v.len()).sum());
         
         // 遍历所有输入中的Atomicals
         for (_, atomical_ids) in input_atomicals {
@@ -804,6 +866,7 @@ impl TxParser {
     }
     
     /// 检查Atomical是否已经在操作列表中被处理
+    #[inline]
     fn is_atomical_already_processed(&self, operations: &[AtomicalOperation], atomical_id: &AtomicalId) -> bool {
         operations.iter().any(|op| match op {
             AtomicalOperation::Transfer { id, .. } => id == atomical_id,
@@ -829,6 +892,28 @@ impl TxParser {
         }
         
         None
+    }
+    
+    /// 快速检查交易是否可能包含Atomicals操作
+    #[inline]
+    fn might_contain_atomicals(&self, tx: &Transaction) -> bool {
+        // 检查输出脚本是否可能包含Atomicals操作
+        tx.output.iter().any(|output| self.script_might_contain_atomicals(&output.script_pubkey))
+    }
+    
+    /// 快速检查脚本是否可能包含Atomicals操作
+    #[inline]
+    fn script_might_contain_atomicals(&self, script: &Script) -> bool {
+        // 检查脚本是否包含OP_RETURN
+        let script_bytes = script.as_bytes();
+        script_bytes.len() > 1 && script_bytes[0] == OP_RETURN.to_u8()
+    }
+    
+    /// 批量解析多个交易
+    pub fn parse_transactions(&self, txs: &[Transaction]) -> Vec<(bitcoin::Txid, Result<Vec<AtomicalOperation>, ParseError>)> {
+        txs.par_iter()
+            .map(|tx| (tx.txid(), self.parse_transaction(tx)))
+            .collect()
     }
 }
 
@@ -1239,3 +1324,5 @@ mod tests {
         }
     }
 }
+
+const ATOMICALS_PREFIX: &[u8] = b"atom";
