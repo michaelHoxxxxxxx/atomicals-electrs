@@ -61,7 +61,7 @@ warp = "0.3"
 tokio-tungstenite = "0.20"
 futures = "0.3"
 uuid = { version = "1.4", features = ["v4"] }
-tokio = { version = "1.25", features = ["full"] }
+tokio = { version = "1.44", features = ["full"] }
 snap = "1.1"
 lz4 = "1.24"
 lru = "0.10"
