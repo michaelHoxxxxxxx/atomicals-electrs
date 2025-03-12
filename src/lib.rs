@@ -16,6 +16,7 @@ pub mod atomicals {
     pub mod indexer;
     pub mod metrics;
     pub mod util;
+    pub mod transaction_log;
 
     pub use protocol::{AtomicalId, AtomicalOperation, AtomicalType};
     pub use state::{AtomicalsState, AtomicalOutput};
@@ -25,6 +26,7 @@ pub mod atomicals {
     pub use indexer::AtomicalsIndexer;
     pub use validation::AtomicalsValidator;
     pub use tx_parser::TxParser;
+    pub use transaction_log::{TransactionManager, TransactionState};
 }
 
 pub mod chain;

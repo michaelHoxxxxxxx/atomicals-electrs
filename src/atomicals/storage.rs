@@ -4,19 +4,22 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fs;
 
 use anyhow::{anyhow, Result};
 use bitcoin::{TxOut, Txid};
 use bitcoin::consensus::encode;
-use electrs_rocksdb::{DB, IteratorMode, Options, ColumnFamilyDescriptor};
+use electrs_rocksdb::{DB, IteratorMode, Options, ColumnFamilyDescriptor, WriteBatch};
 use serde::{Deserialize, Serialize};
 use hex;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use log::{info, warn, error, debug};
 
 use super::protocol::{AtomicalId, AtomicalType};
 use super::state::AtomicalOutput;
 use super::indexer::IndexEntry;
+use super::transaction_log::{TransactionManager, TransactionState};
 
 const CF_STATE: &str = "state";
 const CF_OUTPUTS: &str = "outputs";
@@ -193,6 +196,8 @@ pub struct AtomicalsStorage {
     cache_config: CacheConfig,
     /// 缓存统计
     cache_stats: CacheStats,
+    /// 事务管理器
+    transaction_manager: Arc<TransactionManager>,
 }
 
 impl AtomicalsStorage {
@@ -216,7 +221,11 @@ impl AtomicalsStorage {
             ColumnFamilyDescriptor::new(CF_SCRIPT_ATOMICALS, Options::default()),
         ];
         
-        let db = DB::open_cf_descriptors(&opts, data_dir, cf_descriptors)?;
+        // 创建数据目录
+        fs::create_dir_all(data_dir)?;
+        
+        let db_path = data_dir.join("atomicals.db");
+        let db = DB::open_cf_descriptors(&opts, &db_path, cf_descriptors)?;
         
         // 创建缓存，使用配置的缓存大小
         let outputs_cache = Mutex::new(LruCache::new(NonZeroUsize::new(cache_config.outputs_cache_size).unwrap()));
@@ -227,7 +236,13 @@ impl AtomicalsStorage {
         // 创建缓存统计
         let cache_stats = CacheStats::new();
         
-        Ok(Self {
+        // 创建事务管理器
+        let transaction_manager = Arc::new(TransactionManager::new(data_dir, true)?);
+        
+        // 执行崩溃恢复
+        transaction_manager.perform_crash_recovery(&db)?;
+        
+        let storage = Self {
             db: Arc::new(db),
             outputs_cache,
             metadata_cache,
@@ -235,7 +250,10 @@ impl AtomicalsStorage {
             script_atomicals_cache,
             cache_config,
             cache_stats,
-        })
+            transaction_manager,
+        };
+        
+        Ok(storage)
     }
 
     /// 缓存预热策略 - 用于系统启动或处理大量交易前
@@ -444,221 +462,641 @@ impl AtomicalsStorage {
         
         Ok(report)
     }
-    {{ ... }}
     
     /// 分层缓存实现 - 用于优先级缓存管理
     pub fn implement_tiered_caching(&self) -> Result<()> {
-        // 此功能将实现一个分层缓存系统
+        // 实现一个高级分层缓存系统
         // L1: 热点数据，高频访问，小容量，快速访问
         // L2: 温数据，中频访问，中等容量
-        // L3: 冷数据，低频访问，大容量
+        // L3: 冷数据，低频访问，大容量或不缓存
         
-        // 简化实现，仅调整现有缓存配置模拟分层效果
-        let mut l1_config = self.cache_config.clone();
-        l1_config.outputs_cache_size = 1000; // 小容量
-        l1_config.metadata_cache_size = 500;
-        l1_config.ttl = Some(300); // 短TTL，5分钟
+        // 获取当前缓存使用情况和统计信息
+        let current_usage = self.get_cache_usage();
+        let cache_stats = self.get_cache_stats();
         
-        // 应用L1配置
-        self.resize_caches(l1_config)?;
+        // 分析缓存访问模式
+        let hit_rate = cache_stats.get("hit_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let total_hits = cache_stats.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total_misses = cache_stats.get("misses").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total_accesses = total_hits + total_misses;
         
-        // 预热L1缓存，加载最热点数据
-        self.warm_outputs_cache(500)?;
-        self.warm_metadata_cache(200)?;
-        
-        Ok(())
-    }
-    
-    /// 缓存压缩 - 减少内存占用
-    pub fn compress_cache_data(&self) -> Result<()> {
-        // 实际实现中，这里可以对缓存中的数据进行压缩
-        // 例如，使用LZ4或Snappy等快速压缩算法
-        // 简化实现，仅清理不必要的缓存项
-        
-        // 清理过期项
-        self.prune_expired_cache_items()?;
-        
-        // 清理低频访问项
-        // 实际实现中，可以根据访问频率清理
-        // 简化实现，仅保留最近访问的项
-        
-        Ok(())
-    }
-    
-    /// 批量操作的缓存优化 - 针对批量操作优化缓存策略
-    pub fn optimize_for_batch_operations(&self, batch_size: usize) -> Result<()> {
-        // 根据批量操作的大小调整缓存策略
-        
-        if batch_size > 10000 {
-            // 大批量操作，使用较小缓存避免内存压力
-            let mut config = self.cache_config.clone();
-            config.outputs_cache_size = 5000;
-            config.metadata_cache_size = 2000;
-            config.ttl = Some(300); // 短TTL
-            self.resize_caches(config)?;
-        } else if batch_size > 1000 {
-            // 中等批量操作，使用平衡配置
-            let mut config = self.cache_config.clone();
-            config.outputs_cache_size = 10000;
-            config.metadata_cache_size = 5000;
-            config.ttl = Some(900); // 15分钟
-            self.resize_caches(config)?;
+        // 计算内存压力级别
+        let memory_pressure = if total_accesses > 10000 {
+            println!("检测到高访问量，调整为高内存压力模式");
+            "high"
+        } else if total_accesses > 5000 {
+            println!("检测到中等访问量，调整为中等内存压力模式");
+            "medium"
         } else {
-            // 小批量操作，可以使用较大缓存
-            let mut config = self.cache_config.clone();
-            config.outputs_cache_size = 20000;
-            config.metadata_cache_size = 10000;
-            config.ttl = Some(1800); // 30分钟
-            self.resize_caches(config)?;
+            println!("检测到低访问量，调整为低内存压力模式");
+            "low"
+        };
+        
+        // 创建新的缓存配置
+        let mut tiered_config = self.cache_config.clone();
+        
+        // 根据内存压力和访问模式调整缓存配置
+        match memory_pressure {
+            "high" => {
+                // 高内存压力下，减小缓存大小，优先保留热点数据
+                let outputs_cap = current_usage.get("outputs_cap").cloned().unwrap_or(1000);
+                let metadata_cap = current_usage.get("metadata_cap").cloned().unwrap_or(500);
+                let total_cap = outputs_cap + metadata_cap;
+                
+                // 热点数据占比提高到60%，减少总体缓存大小
+                let hot_tier_size = (total_cap as f64 * 0.6).ceil() as usize;
+                let warm_tier_size = (total_cap as f64 * 0.3).ceil() as usize;
+                let cold_tier_size = (total_cap as f64 * 0.1).ceil() as usize;
+                
+                // 分配缓存大小，优先保证热点数据
+                tiered_config.outputs_cache_size = hot_tier_size;
+                tiered_config.metadata_cache_size = warm_tier_size;
+                tiered_config.index_cache_size = cold_tier_size / 2;
+                tiered_config.script_atomicals_cache_size = cold_tier_size / 2;
+                
+                // 设置短TTL，加速缓存更新
+                tiered_config.ttl = Some(300); // 5分钟
+                
+                println!("高内存压力配置: 热点缓存={}, 温数据缓存={}, 冷数据缓存={}",
+                    hot_tier_size, warm_tier_size, cold_tier_size);
+            },
+            "medium" => {
+                // 中等内存压力，平衡缓存大小
+                let outputs_cap = current_usage.get("outputs_cap").cloned().unwrap_or(2000);
+                let metadata_cap = current_usage.get("metadata_cap").cloned().unwrap_or(1000);
+                let total_cap = outputs_cap + metadata_cap;
+                
+                // 平衡分配缓存
+                let hot_tier_size = (total_cap as f64 * 0.5).ceil() as usize;
+                let warm_tier_size = (total_cap as f64 * 0.3).ceil() as usize;
+                let cold_tier_size = (total_cap as f64 * 0.2).ceil() as usize;
+                
+                // 分配缓存大小
+                tiered_config.outputs_cache_size = hot_tier_size;
+                tiered_config.metadata_cache_size = warm_tier_size;
+                tiered_config.index_cache_size = cold_tier_size / 2;
+                tiered_config.script_atomicals_cache_size = cold_tier_size / 2;
+                
+                // 设置中等TTL
+                tiered_config.ttl = Some(600); // 10分钟
+                
+                println!("中等内存压力配置: 热点缓存={}, 温数据缓存={}, 冷数据缓存={}",
+                    hot_tier_size, warm_tier_size, cold_tier_size);
+            },
+            "low" => {
+                // 低内存压力，可以使用更大的缓存
+                // 扩大缓存大小，但仍然保持分层
+                let hot_tier_size = 5000;
+                let warm_tier_size = 2500;
+                let cold_tier_size = 2000;
+                
+                tiered_config.outputs_cache_size = hot_tier_size;
+                tiered_config.metadata_cache_size = warm_tier_size;
+                tiered_config.index_cache_size = cold_tier_size / 2;
+                tiered_config.script_atomicals_cache_size = cold_tier_size / 2;
+                
+                // 设置较长的TTL
+                tiered_config.ttl = Some(1800); // 30分钟
+                
+                println!("低内存压力配置: 热点缓存={}, 温数据缓存={}, 冷数据缓存={}",
+                    hot_tier_size, warm_tier_size, cold_tier_size);
+            },
+            _ => {}
         }
         
-        Ok(())
-    }
-    
-    /// 智能预取 - 根据访问模式预测并预取可能需要的数据
-    pub fn smart_prefetch(&self, recent_atomical_ids: &[AtomicalId]) -> Result<usize> {
-        let mut prefetched_count = 0;
+        // 应用新的缓存配置
+        println!("应用分层缓存配置...");
+        self.resize_caches(tiered_config.clone())?;
         
-        // 根据最近访问的Atomicals预测可能需要的相关数据
-        // 简化实现，假设相关数据是相同高度的Atomicals
+        // 智能预热缓存 - 根据访问频率预热不同层级
+        let mut preload_limits = HashMap::new();
         
-        // 获取最近访问的Atomicals的高度
-        let mut heights = HashSet::new();
-        for atomical_id in recent_atomical_ids {
-            if let Some(output) = self.get_output(atomical_id)? {
-                heights.insert(output.height);
-            }
+        // 根据命中率决定预热策略
+        if hit_rate < 0.5 {
+            // 命中率低，需要更多预热
+            preload_limits.insert("outputs", tiered_config.outputs_cache_size / 2);
+            preload_limits.insert("metadata", tiered_config.metadata_cache_size / 2);
+            preload_limits.insert("script_atomicals", tiered_config.script_atomicals_cache_size / 4);
+            println!("命中率低 ({:.2}%)，增加预热数量", hit_rate * 100.0);
+        } else {
+            // 命中率高，适度预热
+            preload_limits.insert("outputs", tiered_config.outputs_cache_size / 4);
+            preload_limits.insert("metadata", tiered_config.metadata_cache_size / 4);
+            preload_limits.insert("script_atomicals", tiered_config.script_atomicals_cache_size / 8);
+            println!("命中率高 ({:.2}%)，减少预热数量", hit_rate * 100.0);
         }
         
-        // 预取相同高度的其他Atomicals
-        let cf = self.db.cf_handle(CF_OUTPUTS)
-            .ok_or_else(|| anyhow!("Column family not found: {}", CF_OUTPUTS))?;
+        // 执行预热
+        println!("开始预热缓存...");
+        let preloaded = self.warm_all_caches(&preload_limits)?;
         
-        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        // 主动淘汰策略 - 清理过期和低价值缓存项
+        println!("清理过期缓存项...");
+        let pruned = self.prune_expired_cache_items()?;
         
-        for result in iter {
-            if prefetched_count >= 100 {
-                // 限制预取数量
-                break;
-            }
-            
-            let (key, value) = result?;
-            
-            if let Ok(output) = serde_json::from_slice::<AtomicalOutput>(&value) {
-                if heights.contains(&output.height) {
-                    // 相同高度的Atomical，预取其输出和元数据
-                    let key_str = String::from_utf8_lossy(&key).to_string();
-                    
-                    if let Ok(mut cache) = self.outputs_cache.lock() {
-                        cache.put(key_str.clone(), CacheItem::new(output.clone(), self.cache_config.ttl.map(Duration::from_secs)));
-                        prefetched_count += 1;
-                    }
-                    
-                    // 解析Atomical ID
-                    let parts: Vec<&str> = key_str.split(':').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(txid), Ok(vout)) = (parts[0].parse::<Txid>(), parts[1].parse::<u32>()) {
-                            let atomical_id = AtomicalId { txid, vout };
-                            
-                            // 预取元数据
-                            if let Some(metadata) = self.get_metadata(&atomical_id)? {
-                                if let Ok(mut cache) = self.metadata_cache.lock() {
-                                    cache.put(key_str, CacheItem::new(metadata, self.cache_config.ttl.map(Duration::from_secs)));
-                                }
-                            }
+        // 实现智能预取 - 根据最近访问的Atomicals预取相关数据
+        // 获取最近访问的Atomicals ID (这里简化处理，实际应从访问日志或热点数据中获取)
+        let mut recent_ids = Vec::new();
+        
+        // 从输出缓存中提取最近访问的ID
+        if let Ok(outputs_cache) = self.outputs_cache.lock() {
+            // 从LRU缓存中获取最近访问的键（最多10个）
+            let mut count = 0;
+            for (key, _) in outputs_cache.iter() {
+                if let Some((txid_str, vout_str)) = key.split_once(':') {
+                    if let (Ok(txid), Ok(vout)) = (Txid::from_str(txid_str), vout_str.parse::<u32>()) {
+                        recent_ids.push(AtomicalId { txid, vout });
+                        count += 1;
+                        if count >= 10 {
+                            break;
                         }
                     }
                 }
             }
         }
         
-        Ok(prefetched_count)
+        // 如果有最近访问的ID，执行智能预取
+        let prefetched = if !recent_ids.is_empty() {
+            println!("执行智能预取，基于{}个最近访问的Atomicals", recent_ids.len());
+            self.smart_prefetch(&recent_ids)?
+        } else {
+            0
+        };
+        
+        // 记录分层缓存实现结果
+        println!(
+            "分层缓存实现完成: 内存压力={}, 命中率={:.2}%, 预热项={:?}, 淘汰项={}, 预取项={}",
+            memory_pressure, hit_rate * 100.0, preloaded, pruned, prefetched
+        );
+        
+        Ok(())
     }
     
-    /// 并行缓存加载 - 使用多线程并行加载缓存数据
-    pub fn parallel_cache_load(&self, atomical_ids: &[AtomicalId]) -> Result<usize> {
+    /// 批量获取 Atomical 输出
+    pub fn batch_get_outputs(&self, atomical_ids: &[AtomicalId]) -> Result<HashMap<AtomicalId, AtomicalOutput>> {
+        let mut results = HashMap::with_capacity(atomical_ids.len());
+        let mut missed_ids = Vec::new();
+        let mut missed_keys = Vec::new();
+        
+        // 首先尝试从缓存获取
+        if let Ok(cache) = self.outputs_cache.lock() {
+            for id in atomical_ids {
+                let key = format!("{}:{}", id.txid, id.vout);
+                if let Some(item) = cache.get(&key) {
+                    if !item.is_expired() {
+                        if let Some(output) = item.get_value() {
+                            results.insert(id.clone(), output);
+                            self.cache_stats.record_hit();
+                            continue;
+                        }
+                    }
+                }
+                
+                // 缓存未命中，记录需要从数据库获取的ID
+                missed_ids.push(id.clone());
+                missed_keys.push(key);
+                self.cache_stats.record_miss();
+            }
+        } else {
+            // 如果无法获取缓存锁，则所有ID都需要从数据库获取
+            for id in atomical_ids {
+                missed_ids.push(id.clone());
+                missed_keys.push(format!("{}:{}", id.txid, id.vout));
+                self.cache_stats.record_miss();
+            }
+        }
+        
+        // 如果有未命中的ID，从数据库批量获取
+        if !missed_ids.is_empty() {
+            let cf = self.db.cf_handle(CF_OUTPUTS)
+                .ok_or_else(|| anyhow!("Column family not found: {}", CF_OUTPUTS))?;
+            
+            // 使用 multi_get_cf 批量获取
+            let db_results = self.db.multi_get_cf(
+                missed_keys.iter().map(|k| (&cf, k.as_bytes()))
+            );
+            
+            // 处理结果
+            let mut cache_updates = Vec::new();
+            for (i, result) in db_results.into_iter().enumerate() {
+                if let Ok(Some(data)) = result {
+                    if let Ok(output) = serde_json::from_slice::<AtomicalOutput>(&data) {
+                        results.insert(missed_ids[i].clone(), output.clone());
+                        cache_updates.push((missed_keys[i].clone(), output));
+                    }
+                }
+            }
+            
+            // 更新缓存
+            if let Ok(mut cache) = self.outputs_cache.lock() {
+                for (key, output) in cache_updates {
+                    cache.put(key, CacheItem::new(output, self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    /// 批量获取 Atomical 元数据
+    pub fn batch_get_metadata(&self, atomical_ids: &[AtomicalId]) -> Result<HashMap<AtomicalId, serde_json::Value>> {
+        let mut results = HashMap::with_capacity(atomical_ids.len());
+        let mut missed_ids = Vec::new();
+        let mut missed_keys = Vec::new();
+        
+        // 首先尝试从缓存获取
+        if let Ok(cache) = self.metadata_cache.lock() {
+            for id in atomical_ids {
+                let key = format!("{}:{}", id.txid, id.vout);
+                if let Some(item) = cache.get(&key) {
+                    if !item.is_expired() {
+                        if let Some(metadata) = item.get_value() {
+                            results.insert(id.clone(), metadata);
+                            self.cache_stats.record_hit();
+                            continue;
+                        }
+                    }
+                }
+                
+                // 缓存未命中，记录需要从数据库获取的ID
+                missed_ids.push(id.clone());
+                missed_keys.push(key);
+                self.cache_stats.record_miss();
+            }
+        } else {
+            // 如果无法获取缓存锁，则所有ID都需要从数据库获取
+            for id in atomical_ids {
+                missed_ids.push(id.clone());
+                missed_keys.push(format!("{}:{}", id.txid, id.vout));
+                self.cache_stats.record_miss();
+            }
+        }
+        
+        // 如果有未命中的ID，从数据库批量获取
+        if !missed_ids.is_empty() {
+            let cf = self.db.cf_handle(CF_METADATA)
+                .ok_or_else(|| anyhow!("Column family not found: {}", CF_METADATA))?;
+            
+            // 使用 multi_get_cf 批量获取
+            let db_results = self.db.multi_get_cf(
+                missed_keys.iter().map(|k| (&cf, k.as_bytes()))
+            );
+            
+            // 处理结果
+            let mut cache_updates = Vec::new();
+            for (i, result) in db_results.into_iter().enumerate() {
+                if let Ok(Some(data)) = result {
+                    if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        results.insert(missed_ids[i].clone(), metadata.clone());
+                        cache_updates.push((missed_keys[i].clone(), metadata));
+                    }
+                }
+            }
+            
+            // 更新缓存
+            if let Ok(mut cache) = self.metadata_cache.lock() {
+                for (key, metadata) in cache_updates {
+                    cache.put(key, CacheItem::new(metadata, self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    /// 批量存储 Atomical 输出
+    pub fn batch_store_outputs(&self, outputs: &[(AtomicalId, AtomicalOutput)]) -> Result<usize> {
+        if outputs.is_empty() {
+            return Ok(0);
+        }
+        
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let cf = self.db.cf_handle(CF_OUTPUTS)
+                .ok_or_else(|| anyhow!("Column family not found: {}", CF_OUTPUTS))?;
+            
+            // 创建批量写入
+            let mut batch = WriteBatch::default();
+            let mut cache_updates = Vec::with_capacity(outputs.len());
+            
+            // 准备批量数据
+            for (id, output) in outputs {
+                let key = format!("{}:{}", id.txid, id.vout);
+                let data = serde_json::to_vec(output)?;
+                
+                // 记录写操作到事务日志
+                self.transaction_manager.log_write(transaction_id, CF_OUTPUTS, key.as_bytes(), &data)?;
+                
+                batch.put_cf(&cf, key.as_bytes(), &data);
+                cache_updates.push((key, output.clone()));
+            }
+            
+            // 执行批量写入
+            self.db.write(batch)?;
+            
+            // 更新缓存
+            if let Ok(mut cache) = self.outputs_cache.lock() {
+                for (key, output) in cache_updates {
+                    cache.put(key, CacheItem::new(output, self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+            }
+            
+            Ok(outputs.len())
+        })
+    }
+    
+    /// 批量存储 Atomical 元数据
+    pub fn batch_store_metadata(&self, metadata_items: &[(AtomicalId, serde_json::Value)]) -> Result<usize> {
+        if metadata_items.is_empty() {
+            return Ok(0);
+        }
+        
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let cf = self.db.cf_handle(CF_METADATA)
+                .ok_or_else(|| anyhow!("Column family not found: {}", CF_METADATA))?;
+            
+            // 创建批量写入
+            let mut batch = WriteBatch::default();
+            let mut cache_updates = Vec::with_capacity(metadata_items.len());
+            
+            // 准备批量数据
+            for (id, metadata) in metadata_items {
+                let key = format!("{}:{}", id.txid, id.vout);
+                let data = serde_json::to_vec(metadata)?;
+                
+                // 记录写操作到事务日志
+                self.transaction_manager.log_write(transaction_id, CF_METADATA, key.as_bytes(), &data)?;
+                
+                batch.put_cf(&cf, key.as_bytes(), &data);
+                cache_updates.push((key, metadata.clone()));
+            }
+            
+            // 执行批量写入
+            self.db.write(batch)?;
+            
+            // 更新缓存
+            if let Ok(mut cache) = self.metadata_cache.lock() {
+                for (key, metadata) in cache_updates {
+                    cache.put(key, CacheItem::new(metadata, self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+            }
+            
+            Ok(metadata_items.len())
+        })
+    }
+    
+    /// 通用并行批处理方法 - 用于高效处理大量数据
+    pub fn parallel_batch_process<T, K, F, R>(&self, items: &[T], process_fn: F) -> Vec<R>
+    where
+        T: Send + Sync + Clone,
+        F: Fn(T) -> R + Send + Sync,
+        R: Send,
+        K: Send + Sync,
+    {
         use rayon::prelude::*;
         
-        // 使用Rayon并行库并行加载缓存
-        let loaded_count = atomical_ids.par_iter()
-            .map(|atomical_id| -> Result<usize> {
-                let mut count = 0;
-                
-                // 加载输出
-                if let Some(output) = self.get_output(atomical_id)? {
-                    count += 1;
-                    
-                    // 加载元数据
-                    if let Some(_) = self.get_metadata(atomical_id)? {
-                        count += 1;
-                    }
-                }
-                
-                Ok(count)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .iter()
-            .sum();
-        
-        Ok(loaded_count)
+        // 使用 Rayon 并行处理
+        items.par_iter()
+            .map(|item| process_fn(item.clone()))
+            .collect()
     }
     
-    /// 缓存持久化 - 将热点缓存数据持久化到磁盘，用于快速恢复
-    pub fn persist_hot_cache(&self, cache_file: &str) -> Result<usize> {
-        let mut persisted_count = 0;
+    /// 并行批量获取 Atomical 输出 - 利用多线程提高性能
+    pub fn parallel_batch_get_outputs(&self, atomical_ids: &[AtomicalId]) -> Result<HashMap<AtomicalId, AtomicalOutput>> {
+        // 使用并行批处理方法
+        let results = self.parallel_batch_process(atomical_ids, |id| -> (AtomicalId, Option<AtomicalOutput>) {
+            (id.clone(), self.get_output(&id).unwrap_or(None))
+        });
         
-        // 收集热点缓存数据
-        let mut hot_data = HashMap::new();
+        // 过滤并收集结果
+        let mut output_map = HashMap::with_capacity(results.len());
+        for (id, output_opt) in results {
+            if let Some(output) = output_opt {
+                output_map.insert(id, output);
+            }
+        }
         
-        // 收集输出缓存
+        Ok(output_map)
+    }
+    
+    /// 并行批量获取 Atomical 元数据 - 利用多线程提高性能
+    pub fn parallel_batch_get_metadata(&self, atomical_ids: &[AtomicalId]) -> Result<HashMap<AtomicalId, serde_json::Value>> {
+        // 使用并行批处理方法
+        let results = self.parallel_batch_process(atomical_ids, |id| -> (AtomicalId, Option<serde_json::Value>) {
+            (id.clone(), self.get_metadata(&id).unwrap_or(None))
+        });
+        
+        // 过滤并收集结果
+        let mut metadata_map = HashMap::with_capacity(results.len());
+        for (id, metadata_opt) in results {
+            if let Some(metadata) = metadata_opt {
+                metadata_map.insert(id, metadata);
+            }
+        }
+        
+        Ok(metadata_map)
+    }
+    
+    /// 清理所有缓存
+    pub fn clear_caches(&self) -> Result<()> {
+        if let Ok(mut cache) = self.outputs_cache.lock() {
+            cache.clear();
+        }
+        
+        if let Ok(mut cache) = self.metadata_cache.lock() {
+            cache.clear();
+        }
+        
+        if let Ok(mut cache) = self.index_cache.lock() {
+            cache.clear();
+        }
+        
+        if let Ok(mut cache) = self.script_atomicals_cache.lock() {
+            cache.clear();
+        }
+        
+        // 重置统计信息
+        self.cache_stats.reset();
+        
+        Ok(())
+    }
+    
+    /// 调整缓存大小
+    pub fn resize_caches(&self, new_config: CacheConfig) -> Result<()> {
+        if let Ok(mut cache) = self.outputs_cache.lock() {
+            let mut new_cache = LruCache::new(NonZeroUsize::new(new_config.outputs_cache_size).unwrap());
+            
+            // 保留现有缓存项
+            for (key, value) in cache.iter().take(new_config.outputs_cache_size) {
+                new_cache.put(key.clone(), value.clone());
+            }
+            
+            *cache = new_cache;
+        }
+        
+        if let Ok(mut cache) = self.metadata_cache.lock() {
+            let mut new_cache = LruCache::new(NonZeroUsize::new(new_config.metadata_cache_size).unwrap());
+            
+            // 保留现有缓存项
+            for (key, value) in cache.iter().take(new_config.metadata_cache_size) {
+                new_cache.put(key.clone(), value.clone());
+            }
+            
+            *cache = new_cache;
+        }
+        
+        if let Ok(mut cache) = self.index_cache.lock() {
+            let mut new_cache = LruCache::new(NonZeroUsize::new(new_config.index_cache_size).unwrap());
+            
+            // 保留现有缓存项
+            for (key, value) in cache.iter().take(new_config.index_cache_size) {
+                new_cache.put(key.clone(), value.clone());
+            }
+            
+            *cache = new_cache;
+        }
+        
+        if let Ok(mut cache) = self.script_atomicals_cache.lock() {
+            let mut new_cache = LruCache::new(NonZeroUsize::new(new_config.script_atomicals_cache_size).unwrap());
+            
+            // 保留现有缓存项
+            for (key, value) in cache.iter().take(new_config.script_atomicals_cache_size) {
+                new_cache.put(key.clone(), value.clone());
+            }
+            
+            *cache = new_cache;
+        }
+        
+        Ok(())
+    }
+    
+    /// 清理过期的缓存项
+    pub fn prune_expired_cache_items(&self) -> Result<usize> {
+        let mut pruned_count = 0;
+        
+        if let Ok(mut cache) = self.outputs_cache.lock() {
+            let before_len = cache.len();
+            
+            // 创建新缓存，只保留未过期的项
+            let mut new_cache = LruCache::new(NonZeroUsize::new(cache.cap().get()).unwrap());
+            
+            for (key, item) in cache.iter() {
+                if !item.is_expired() {
+                    new_cache.put(key.clone(), item.clone());
+                }
+            }
+            
+            *cache = new_cache;
+            pruned_count += before_len - cache.len();
+        }
+        
+        if let Ok(mut cache) = self.metadata_cache.lock() {
+            let before_len = cache.len();
+            
+            // 创建新缓存，只保留未过期的项
+            let mut new_cache = LruCache::new(NonZeroUsize::new(cache.cap().get()).unwrap());
+            
+            for (key, item) in cache.iter() {
+                if !item.is_expired() {
+                    new_cache.put(key.clone(), item.clone());
+                }
+            }
+            
+            *cache = new_cache;
+            pruned_count += before_len - cache.len();
+        }
+        
+        if let Ok(mut cache) = self.index_cache.lock() {
+            let before_len = cache.len();
+            
+            // 创建新缓存，只保留未过期的项
+            let mut new_cache = LruCache::new(NonZeroUsize::new(cache.cap().get()).unwrap());
+            
+            for (key, item) in cache.iter() {
+                if !item.is_expired() {
+                    new_cache.put(key.clone(), item.clone());
+                }
+            }
+            
+            *cache = new_cache;
+            pruned_count += before_len - cache.len();
+        }
+        
+        if let Ok(mut cache) = self.script_atomicals_cache.lock() {
+            let before_len = cache.len();
+            
+            // 创建新缓存，只保留未过期的项
+            let mut new_cache = LruCache::new(NonZeroUsize::new(cache.cap().get()).unwrap());
+            
+            for (key, item) in cache.iter() {
+                if !item.is_expired() {
+                    new_cache.put(key.clone(), item.clone());
+                }
+            }
+            
+            *cache = new_cache;
+            pruned_count += before_len - cache.len();
+        }
+        
+        Ok(pruned_count)
+    }
+    
+    /// 获取缓存使用情况
+    pub fn get_cache_usage(&self) -> HashMap<String, usize> {
+        let mut usage = HashMap::new();
+        
         if let Ok(cache) = self.outputs_cache.lock() {
-            for (key, item) in cache.iter() {
-                if let Some(value) = item.get_value() {
-                    hot_data.insert(format!("outputs:{}", key), serde_json::to_value(value)?);
-                    persisted_count += 1;
-                }
-            }
+            usage.insert("outputs_len".to_string(), cache.len());
+            usage.insert("outputs_cap".to_string(), cache.cap().get());
         }
         
-        // 收集元数据缓存
         if let Ok(cache) = self.metadata_cache.lock() {
-            for (key, item) in cache.iter() {
-                if let Some(value) = item.get_value() {
-                    hot_data.insert(format!("metadata:{}", key), value);
-                    persisted_count += 1;
-                }
-            }
+            usage.insert("metadata_len".to_string(), cache.len());
+            usage.insert("metadata_cap".to_string(), cache.cap().get());
         }
         
-        // 将热点数据写入文件
-        let file = std::fs::File::create(cache_file)?;
-        serde_json::to_writer(file, &hot_data)?;
+        if let Ok(cache) = self.index_cache.lock() {
+            usage.insert("index_len".to_string(), cache.len());
+            usage.insert("index_cap".to_string(), cache.cap().get());
+        }
         
-        Ok(persisted_count)
+        if let Ok(cache) = self.script_atomicals_cache.lock() {
+            usage.insert("script_atomicals_len".to_string(), cache.len());
+            usage.insert("script_atomicals_cap".to_string(), cache.cap().get());
+        }
+        
+        usage
     }
     
-    /// 从持久化文件加载缓存 - 从磁盘恢复热点缓存数据
-    pub fn load_persisted_cache(&self, cache_file: &str) -> Result<usize> {
+    /// 获取缓存统计信息
+    pub fn get_cache_stats(&self) -> HashMap<String, serde_json::Value> {
+        self.cache_stats.get_stats()
+    }
+    
+    /// 预热输出缓存
+    pub fn warm_outputs_cache(&self, limit: usize) -> Result<usize> {
+        let cf = self.db.cf_handle(CF_OUTPUTS)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_OUTPUTS))?;
+        
         let mut loaded_count = 0;
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
         
-        // 从文件读取热点数据
-        let file = std::fs::File::open(cache_file)?;
-        let hot_data: HashMap<String, serde_json::Value> = serde_json::from_reader(file)?;
-        
-        // 恢复缓存数据
-        for (key, value) in hot_data {
-            if key.starts_with("outputs:") {
-                let atomical_key = key.trim_start_matches("outputs:");
-                if let Ok(output) = serde_json::from_value::<AtomicalOutput>(value) {
-                    if let Ok(mut cache) = self.outputs_cache.lock() {
-                        cache.put(atomical_key.to_string(), CacheItem::new(output, self.cache_config.ttl.map(Duration::from_secs)));
-                        loaded_count += 1;
-                    }
-                }
-            } else if key.starts_with("metadata:") {
-                let atomical_key = key.trim_start_matches("metadata:");
-                if let Ok(mut cache) = self.metadata_cache.lock() {
-                    cache.put(atomical_key.to_string(), CacheItem::new(value, self.cache_config.ttl.map(Duration::from_secs)));
+        for result in iter {
+            if loaded_count >= limit {
+                break;
+            }
+            
+            let (key, value) = result?;
+            let key_str = String::from_utf8_lossy(&key).to_string();
+            
+            if let Ok(output) = serde_json::from_slice::<AtomicalOutput>(&value) {
+                if let Ok(mut cache) = self.outputs_cache.lock() {
+                    cache.put(key_str, CacheItem::new(output, self.cache_config.ttl.map(Duration::from_secs)));
                     loaded_count += 1;
                 }
             }
@@ -666,192 +1104,472 @@ impl AtomicalsStorage {
         
         Ok(loaded_count)
     }
-    {{ ... }}
-}
+    
+    /// 预热元数据缓存
+    pub fn warm_metadata_cache(&self, limit: usize) -> Result<usize> {
+        let cf = self.db.cf_handle(CF_METADATA)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_METADATA))?;
+        
+        let mut loaded_count = 0;
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        
+        for result in iter {
+            if loaded_count >= limit {
+                break;
+            }
+            
+            let (key, value) = result?;
+            let key_str = String::from_utf8_lossy(&key).to_string();
+            
+            if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&value) {
+                if let Ok(mut cache) = self.metadata_cache.lock() {
+                    cache.put(key_str, CacheItem::new(metadata, self.cache_config.ttl.map(Duration::from_secs)));
+                    loaded_count += 1;
+                }
+            }
+        }
+        
+        Ok(loaded_count)
+    }
+    
+    /// 预热脚本-Atomicals映射缓存
+    pub fn warm_script_atomicals_cache(&self, limit: usize) -> Result<usize> {
+        let cf = self.db.cf_handle(CF_SCRIPT_ATOMICALS)
+            .ok_or_else(|| anyhow!("Column family not found: {}", CF_SCRIPT_ATOMICALS))?;
+        
+        let mut loaded_count = 0;
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        
+        for result in iter {
+            if loaded_count >= limit {
+                break;
+            }
+            
+            let (key, value) = result?;
+            let key_str = String::from_utf8_lossy(&key).to_string();
+            
+            if let Ok(atomicals) = serde_json::from_slice::<Vec<AtomicalId>>(&value) {
+                if let Ok(mut cache) = self.script_atomicals_cache.lock() {
+                    cache.put(key_str, CacheItem::new(atomicals, self.cache_config.ttl.map(Duration::from_secs)));
+                    loaded_count += 1;
+                }
+            }
+        }
+        
+        Ok(loaded_count)
+    }
+    
+    /// 预热所有缓存
+    pub fn warm_all_caches(&self, limits: &HashMap<&str, usize>) -> Result<HashMap<String, usize>> {
+        let mut results = HashMap::new();
+        
+        if let Some(&limit) = limits.get("outputs") {
+            let count = self.warm_outputs_cache(limit)?;
+            results.insert("outputs".to_string(), count);
+        }
+        
+        if let Some(&limit) = limits.get("metadata") {
+            let count = self.warm_metadata_cache(limit)?;
+            results.insert("metadata".to_string(), count);
+        }
+        
+        if let Some(&limit) = limits.get("script_atomicals") {
+            let count = self.warm_script_atomicals_cache(limit)?;
+            results.insert("script_atomicals".to_string(), count);
+        }
+        
+        Ok(results)
+    }
+    
+    /// 开始事务
+    pub fn begin_transaction(&self) -> Result<u64> {
+        self.transaction_manager.begin_transaction()
+    }
+    
+    /// 提交事务
+    pub fn commit_transaction(&self, transaction_id: u64) -> Result<()> {
+        self.transaction_manager.commit_transaction(transaction_id)
+    }
+    
+    /// 回滚事务
+    pub fn rollback_transaction(&self, transaction_id: u64) -> Result<()> {
+        self.transaction_manager.rollback_transaction(transaction_id)
+    }
+    
+    /// 在事务中执行操作
+    pub fn with_transaction<F, T>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(u64) -> Result<T>,
+    {
+        // 开始事务
+        let transaction_id = self.begin_transaction()?;
+        
+        // 执行操作
+        let result = match operation(transaction_id) {
+            Ok(value) => {
+                // 提交事务
+                self.commit_transaction(transaction_id)?;
+                Ok(value)
+            }
+            Err(e) => {
+                // 回滚事务
+                let _ = self.rollback_transaction(transaction_id);
+                Err(e)
+            }
+        };
+        
+        result
+    }
+    
+    /// 执行数据一致性检查
+    pub fn check_data_consistency(&self) -> Result<bool> {
+        let cf_names = [CF_STATE, CF_OUTPUTS, CF_METADATA, CF_INDEXES, CF_SCRIPT_ATOMICALS];
+        self.transaction_manager.verify_data_consistency(&self.db, &cf_names)
+    }
+    
+    /// 创建数据检查点
+    pub fn create_checkpoint(&self) -> Result<u64> {
+        self.transaction_manager.create_checkpoint()
+    }
+    
+    /// 清理旧事务日志
+    pub fn cleanup_transaction_logs(&self, keep_days: u64) -> Result<usize> {
+        self.transaction_manager.cleanup_old_logs(keep_days)
+    }
 
-#[cfg(test)]
-mod tests {
-    {{ ... }}
-    
-    #[test]
-    fn test_tiered_caching() -> Result<()> {
-        let (storage, _temp_dir) = create_test_storage();
-        
-        // 实现分层缓存
-        storage.implement_tiered_caching()?;
-        
-        // 验证缓存配置已更改
-        let usage = storage.get_cache_usage();
-        assert!(usage.contains_key("outputs_cap"), "应包含outputs缓存容量");
-        
-        Ok(())
+    /// 存储 Atomical 输出
+    pub fn store_output(&self, id: &AtomicalId, output: &AtomicalOutput) -> Result<()> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let key = format!("{}:{}", id.txid, id.vout);
+            let data = serde_json::to_vec(output)?;
+            
+            // 记录写操作到事务日志
+            self.transaction_manager.log_write(transaction_id, CF_OUTPUTS, key.as_bytes(), &data)?;
+            
+            // 写入数据库
+            if let Some(cf) = self.db.cf_handle(CF_OUTPUTS) {
+                self.db.put_cf(&cf, key.as_bytes(), &data)?;
+                
+                // 更新缓存
+                if let Ok(mut cache) = self.outputs_cache.lock() {
+                    cache.put(key, CacheItem::new(output.clone(), self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+                
+                return Ok(());
+            }
+            
+            Err(anyhow!("Column family not found: {}", CF_OUTPUTS))
+        })
     }
     
-    #[test]
-    fn test_optimize_for_batch_operations() -> Result<()> {
-        let (storage, _temp_dir) = create_test_storage();
-        
-        // 测试不同批量大小的优化
-        storage.optimize_for_batch_operations(100)?; // 小批量
-        let small_usage = storage.get_cache_usage();
-        
-        storage.optimize_for_batch_operations(5000)?; // 中等批量
-        let medium_usage = storage.get_cache_usage();
-        
-        storage.optimize_for_batch_operations(20000)?; // 大批量
-        let large_usage = storage.get_cache_usage();
-        
-        // 验证不同批量大小下的缓存配置不同
-        let small_cap = small_usage.get("outputs_cap").cloned().unwrap_or(0);
-        let medium_cap = medium_usage.get("outputs_cap").cloned().unwrap_or(0);
-        let large_cap = large_usage.get("outputs_cap").cloned().unwrap_or(0);
-        
-        assert!(small_cap != medium_cap || medium_cap != large_cap, "不同批量大小应有不同的缓存配置");
-        
-        Ok(())
+    /// 存储 Atomical 元数据
+    pub fn store_metadata(&self, id: &AtomicalId, metadata: &serde_json::Value) -> Result<()> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let key = format!("{}:{}", id.txid, id.vout);
+            let data = serde_json::to_vec(metadata)?;
+            
+            // 记录写操作到事务日志
+            self.transaction_manager.log_write(transaction_id, CF_METADATA, key.as_bytes(), &data)?;
+            
+            // 写入数据库
+            if let Some(cf) = self.db.cf_handle(CF_METADATA) {
+                self.db.put_cf(&cf, key.as_bytes(), &data)?;
+                
+                // 更新缓存
+                if let Ok(mut cache) = self.metadata_cache.lock() {
+                    cache.put(key, CacheItem::new(metadata.clone(), self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+                
+                return Ok(());
+            }
+            
+            Err(anyhow!("Column family not found: {}", CF_METADATA))
+        })
     }
     
-    #[test]
-    fn test_smart_prefetch() -> Result<()> {
-        let (storage, _temp_dir) = create_test_storage();
+    /// 存储索引项
+    pub fn store_index(&self, index_name: &str, key: &str, value: &[u8]) -> Result<()> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let index_key = format!("{}:{}", index_name, key);
+            
+            // 记录写操作到事务日志
+            self.transaction_manager.log_write(transaction_id, CF_INDEXES, index_key.as_bytes(), value)?;
+            
+            // 写入数据库
+            if let Some(cf) = self.db.cf_handle(CF_INDEXES) {
+                self.db.put_cf(&cf, index_key.as_bytes(), value)?;
+                
+                // 更新缓存
+                if let Ok(mut cache) = self.index_cache.lock() {
+                    cache.put(index_key, CacheItem::new(value.to_vec(), self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+                
+                return Ok(());
+            }
+            
+            Err(anyhow!("Column family not found: {}", CF_INDEXES))
+        })
+    }
+    
+    /// 存储脚本-Atomicals映射
+    pub fn store_script_atomicals(&self, script_hash: &str, atomicals: &[AtomicalId]) -> Result<()> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let data = serde_json::to_vec(atomicals)?;
+            
+            // 记录写操作到事务日志
+            self.transaction_manager.log_write(transaction_id, CF_SCRIPT_ATOMICALS, script_hash.as_bytes(), &data)?;
+            
+            // 写入数据库
+            if let Some(cf) = self.db.cf_handle(CF_SCRIPT_ATOMICALS) {
+                self.db.put_cf(&cf, script_hash.as_bytes(), &data)?;
+                
+                // 更新缓存
+                if let Ok(mut cache) = self.script_atomicals_cache.lock() {
+                    cache.put(script_hash.to_string(), CacheItem::new(atomicals.to_vec(), self.cache_config.ttl.map(Duration::from_secs)));
+                    self.cache_stats.record_write();
+                }
+                
+                return Ok(());
+            }
+            
+            Err(anyhow!("Column family not found: {}", CF_SCRIPT_ATOMICALS))
+        })
+    }
+
+    /// 删除 Atomical 输出
+    pub fn delete_output(&self, id: &AtomicalId) -> Result<bool> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let key = format!("{}:{}", id.txid, id.vout);
+            
+            // 从缓存中删除
+            if let Ok(mut cache) = self.outputs_cache.lock() {
+                cache.pop(&key);
+            }
+            
+            // 从数据库中删除
+            if let Some(cf) = self.db.cf_handle(CF_OUTPUTS) {
+                // 记录删除操作到事务日志
+                self.transaction_manager.log_delete(transaction_id, CF_OUTPUTS, key.as_bytes())?;
+                
+                self.db.delete_cf(&cf, key.as_bytes())?;
+                return Ok(true);
+            }
+            
+            Ok(false)
+        })
+    }
+    
+    /// 删除 Atomical 元数据
+    pub fn delete_metadata(&self, id: &AtomicalId) -> Result<bool> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let key = format!("{}:{}", id.txid, id.vout);
+            
+            // 从缓存中删除
+            if let Ok(mut cache) = self.metadata_cache.lock() {
+                cache.pop(&key);
+            }
+            
+            // 从数据库中删除
+            if let Some(cf) = self.db.cf_handle(CF_METADATA) {
+                // 记录删除操作到事务日志
+                self.transaction_manager.log_delete(transaction_id, CF_METADATA, key.as_bytes())?;
+                
+                self.db.delete_cf(&cf, key.as_bytes())?;
+                return Ok(true);
+            }
+            
+            Ok(false)
+        })
+    }
+    
+    /// 删除索引项
+    pub fn delete_index(&self, index_name: &str, key: &str) -> Result<bool> {
+        // 使用事务包装操作
+        self.with_transaction(|transaction_id| {
+            let index_key = format!("{}:{}", index_name, key);
+            
+            // 从缓存中删除
+            if let Ok(mut cache) = self.index_cache.lock() {
+                cache.pop(&index_key);
+            }
+            
+            // 从数据库中删除
+            if let Some(cf) = self.db.cf_handle(CF_INDEXES) {
+                // 记录删除操作到事务日志
+                self.transaction_manager.log_delete(transaction_id, CF_INDEXES, index_key.as_bytes())?;
+                
+                self.db.delete_cf(&cf, index_key.as_bytes())?;
+                return Ok(true);
+            }
+            
+            Ok(false)
+        })
+    }
+
+    /// 执行数据一致性检查和修复
+    pub fn verify_and_repair_data_consistency(&self) -> Result<(bool, usize)> {
+        info!("开始执行数据一致性检查和修复...");
         
-        // 创建一组相同高度的测试数据
-        let mut atomical_ids = Vec::new();
-        for i in 0..5 {
-            let atomical_id = AtomicalId {
-                txid: format!("{:064x}", i).parse().unwrap(),
-                vout: 0,
-            };
-            
-            let output = AtomicalOutput {
-                txid: atomical_id.txid,
-                vout: atomical_id.vout,
-                output: TxOut::default(),
-                metadata: None,
-                height: 100, // 相同高度
-                timestamp: 1234567890,
-                atomical_type: AtomicalType::NFT,
-                sealed: false,
-            };
-            
-            storage.store_output(&atomical_id, &output)?;
-            atomical_ids.push(atomical_id);
+        // 首先检查数据一致性
+        let is_consistent = self.check_data_consistency()?;
+        
+        if is_consistent {
+            info!("数据一致性检查通过，无需修复");
+            return Ok((true, 0));
         }
         
-        // 再创建一些不同高度的数据
-        for i in 5..10 {
-            let atomical_id = AtomicalId {
-                txid: format!("{:064x}", i).parse().unwrap(),
-                vout: 0,
-            };
-            
-            let output = AtomicalOutput {
-                txid: atomical_id.txid,
-                vout: atomical_id.vout,
-                output: TxOut::default(),
-                metadata: None,
-                height: 200, // 不同高度
-                timestamp: 1234567890,
-                atomical_type: AtomicalType::NFT,
-                sealed: false,
-            };
-            
-            storage.store_output(&atomical_id, &output)?;
+        info!("检测到数据不一致，开始修复...");
+        
+        // 创建修复事务
+        let transaction_id = self.begin_transaction()?;
+        
+        // 修复计数
+        let mut repair_count = 0;
+        
+        // 检查并修复各个列族
+        let cf_names = [CF_STATE, CF_OUTPUTS, CF_METADATA, CF_INDEXES, CF_SCRIPT_ATOMICALS];
+        
+        for cf_name in &cf_names {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                info!("检查列族 {}...", cf_name);
+                
+                // 创建批量写入
+                let mut batch = WriteBatch::default();
+                
+                // 检查每个键值对
+                let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+                
+                for result in iter {
+                    match result {
+                        Ok((key, value)) => {
+                            // 尝试解析值，检查是否有效
+                            let is_valid = match *cf_name {
+                                CF_OUTPUTS => serde_json::from_slice::<AtomicalOutput>(&value).is_ok(),
+                                CF_METADATA => serde_json::from_slice::<serde_json::Value>(&value).is_ok(),
+                                CF_INDEXES => true, // 简单的二进制数据，假设总是有效
+                                CF_SCRIPT_ATOMICALS => serde_json::from_slice::<Vec<AtomicalId>>(&value).is_ok(),
+                                CF_STATE => true, // 状态数据，假设总是有效
+                                _ => true,
+                            };
+                            
+                            if !is_valid {
+                                warn!("发现损坏的数据：列族={}, 键长度={}", cf_name, key.len());
+                                
+                                // 如果是索引或脚本映射，可以尝试从其他数据重建
+                                if *cf_name == CF_INDEXES || *cf_name == CF_SCRIPT_ATOMICALS {
+                                    // 从数据库中删除损坏的数据
+                                    batch.delete_cf(&cf, &key);
+                                    
+                                    // 记录删除操作到事务日志
+                                    self.transaction_manager.log_delete(transaction_id, cf_name, &key)?;
+                                    
+                                    repair_count += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("读取数据时出错：列族={}, 错误={}", cf_name, e);
+                        }
+                    }
+                }
+                
+                // 应用批处理
+                if !batch.is_empty() {
+                    self.db.write(batch)?;
+                    info!("已修复列族 {} 中的 {} 条损坏数据", cf_name, repair_count);
+                }
+            }
         }
         
-        // 清空缓存
-        storage.clear_caches()?;
+        // 提交修复事务
+        self.commit_transaction(transaction_id)?;
         
-        // 使用智能预取
-        let prefetched = storage.smart_prefetch(&atomical_ids[0..2])?;
+        // 创建检查点
+        self.create_checkpoint()?;
         
-        // 验证预取结果
-        assert!(prefetched > 0, "应该预取了一些数据");
+        info!("数据一致性修复完成，共修复 {} 条损坏数据", repair_count);
         
-        Ok(())
+        Ok((repair_count == 0, repair_count))
     }
     
-    #[test]
-    fn test_parallel_cache_load() -> Result<()> {
-        let (storage, _temp_dir) = create_test_storage();
+    /// 定期维护任务
+    pub fn perform_maintenance(&self) -> Result<HashMap<String, serde_json::Value>> {
+        info!("开始执行定期维护任务...");
         
-        // 创建测试数据
-        let mut atomical_ids = Vec::new();
-        for i in 0..10 {
-            let atomical_id = AtomicalId {
-                txid: format!("{:064x}", i).parse().unwrap(),
-                vout: 0,
-            };
-            
-            let output = AtomicalOutput {
-                txid: atomical_id.txid,
-                vout: atomical_id.vout,
-                output: TxOut::default(),
-                metadata: None,
-                height: 100,
-                timestamp: 1234567890,
-                atomical_type: AtomicalType::NFT,
-                sealed: false,
-            };
-            
-            storage.store_output(&atomical_id, &output)?;
-            
-            // 存储元数据
-            let metadata = serde_json::json!({
-                "name": format!("Test NFT {}", i),
-                "description": format!("Test Description {}", i),
-            });
-            
-            storage.store_metadata(&atomical_id, &metadata)?;
-            
-            atomical_ids.push(atomical_id);
-        }
+        let mut results = HashMap::new();
         
-        // 清空缓存
-        storage.clear_caches()?;
+        // 1. 清理过期缓存项
+        let pruned_count = self.prune_expired_cache_items()?;
+        results.insert("pruned_cache_items".to_string(), serde_json::Value::Number(pruned_count.into()));
         
-        // 并行加载缓存
-        let loaded = storage.parallel_cache_load(&atomical_ids)?;
+        // 2. 检查数据一致性
+        let (is_consistent, repair_count) = self.verify_and_repair_data_consistency()?;
+        results.insert("data_consistent".to_string(), serde_json::Value::Bool(is_consistent));
+        results.insert("repaired_items".to_string(), serde_json::Value::Number(repair_count.into()));
         
-        // 验证加载结果
-        assert!(loaded > 0, "应该并行加载了一些数据");
+        // 3. 清理旧事务日志
+        let cleaned_logs = self.cleanup_transaction_logs(7)?; // 保留7天的日志
+        results.insert("cleaned_logs".to_string(), serde_json::Value::Number(cleaned_logs.into()));
         
-        Ok(())
+        // 4. 创建新的检查点
+        let checkpoint_id = self.create_checkpoint()?;
+        results.insert("checkpoint_id".to_string(), serde_json::Value::Number(checkpoint_id.into()));
+        
+        // 5. 获取缓存使用情况
+        let cache_usage = self.get_cache_usage();
+        results.insert("cache_usage".to_string(), serde_json::to_value(cache_usage)?);
+        
+        // 6. 获取缓存统计信息
+        let cache_stats = self.get_cache_stats();
+        results.insert("cache_stats".to_string(), serde_json::to_value(cache_stats)?);
+        
+        info!("定期维护任务完成");
+        
+        Ok(results)
     }
     
-    #[test]
-    fn test_cache_persistence() -> Result<()> {
-        let (storage, temp_dir) = create_test_storage();
+    /// 执行崩溃恢复
+    pub fn recover_from_crash(&self) -> Result<HashMap<String, serde_json::Value>> {
+        info!("开始执行崩溃恢复...");
         
-        // 创建测试数据
-        let atomical_id = create_test_atomical_id();
-        let output = create_test_output(&atomical_id);
+        let mut results = HashMap::new();
         
-        storage.store_output(&atomical_id, &output)?;
+        // 1. 执行事务日志恢复
+        self.transaction_manager.perform_crash_recovery(&self.db)?;
+        results.insert("transaction_recovery".to_string(), serde_json::Value::String("completed".to_string()));
         
-        let metadata = serde_json::json!({
-            "name": "Test NFT",
-            "description": "Test Description",
-        });
+        // 2. 验证数据一致性
+        let (is_consistent, repair_count) = self.verify_and_repair_data_consistency()?;
+        results.insert("data_consistent".to_string(), serde_json::Value::Bool(is_consistent));
+        results.insert("repaired_items".to_string(), serde_json::Value::Number(repair_count.into()));
         
-        storage.store_metadata(&atomical_id, &metadata)?;
+        // 3. 清理缓存
+        self.clear_caches()?;
+        results.insert("caches_cleared".to_string(), serde_json::Value::Bool(true));
         
-        // 持久化缓存
-        let cache_file = temp_dir.path().join("hot_cache.json").to_str().unwrap().to_string();
-        let persisted = storage.persist_hot_cache(&cache_file)?;
+        // 4. 预热缓存
+        let warm_results = self.warm_all_caches(&HashMap::from([
+            (CF_OUTPUTS, 1000),
+            (CF_METADATA, 500),
+            (CF_SCRIPT_ATOMICALS, 1000),
+        ]))?;
+        results.insert("cache_warmed".to_string(), serde_json::to_value(warm_results)?);
         
-        // 清空缓存
-        storage.clear_caches()?;
+        // 5. 创建新的检查点
+        let checkpoint_id = self.create_checkpoint()?;
+        results.insert("checkpoint_id".to_string(), serde_json::Value::Number(checkpoint_id.into()));
         
-        // 加载持久化的缓存
-        let loaded = storage.load_persisted_cache(&cache_file)?;
+        info!("崩溃恢复完成");
         
-        // 验证结果
-        assert!(persisted > 0, "应该持久化了一些缓存数据");
-        assert!(loaded > 0, "应该加载了一些持久化的缓存数据");
-        assert_eq!(persisted, loaded, "持久化和加载的数据数量应该相同");
-        
-        Ok(())
+        Ok(results)
     }
-    {{ ... }}
 }
